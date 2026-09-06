@@ -4,8 +4,13 @@
  ;; framing from io-ipld-car. Every pin below is a commit on that repo's
  ;; default branch — an unmerged SHA is a dependency that disappears when its
  ;; branch does (root CLAUDE.md, `deps.edn` pins have no `verify-west-pins`).
- :deps {io.github.kotoba-lang/kotobase-protocol-core
-        {:git/sha "cf48a5fe743fb8fdc0fae19c8942b8ad64effdf4"}
+ :deps {;; Tracks protocol-core's `main` tip; it is not held back for a reason.
+        ;; A reader who finds this behind the default branch should advance it
+        ;; rather than look for the justification that would have to be written
+        ;; here if it were deliberately frozen (root CLAUDE.md: a pin's default
+        ;; state is the upstream default-branch tip).
+        io.github.kotoba-lang/kotobase-protocol-core
+        {:git/sha "ca3874d2dababed63bb1c357722c8a38e4a3a812"}
         io.github.kotoba-lang/io-ipld
         {:git/sha "6fc39e62f558521669cf07e8b94e9bbf86ce503f"}
         ;; Floor, not a preference: `ipld.car.trustless/replay-selection` and
