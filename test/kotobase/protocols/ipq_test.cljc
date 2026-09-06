@@ -203,3 +203,127 @@
     (is (= 502 (:status resp)))
     (is (= "unsupported-block-encoding" (get (json-body resp) "error")))
     (is (= "hex" (get (json-body resp) "detail")))))
+
+;; ── the identity a client arrived with, restated at the address ──────────────
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- hex
+  "Byte values as lower-case hex, which is how IPNI metadata gets written down."
+  [bs]
+  (apply str (mapcat (fn [b] [(nth hex-digits (quot b 16))
+                              (nth hex-digits (mod b 16))])
+                     bs)))
+
+(defn- uvarint
+  "Unsigned LEB128, mirroring `ipni.metadata/uvarint-encode`."
+  [n]
+  (loop [n n out []]
+    (if (< n 128)
+      (conj out n)
+      (recur (quot n 128) (conj out (bit-or (bit-and n 0x7F) 0x80))))))
+
+(deftest the-descriptor-states-the-ipni-identity-it-answers-for
+  ;; AUTHORITY: `ipni.metadata` in kotoba-lang/io-ipni-specs --
+  ;; `ipq-selection-http` (0x300940), `ipq-selection-http-registration-request`
+  ;; (0x0940), `ipq-selection-http-bytes` and `kotobase-metadata-bytes`, where
+  ;; the `uvarint(protocol) ++ uvarint(len) ++ payload` framing was measured
+  ;; against go-libipni v0.8.2 rather than read off IPNI.md's prose. That repo
+  ;; is deliberately NOT a dependency of this one -- this handler advertises
+  ;; nothing and has three deps -- so the constants are stated twice on
+  ;; purpose. What is not on purpose is drifting, and that is what this pins:
+  ;; every number below is a literal here and a test change there.
+  (let [{:keys [ctx]} (fixture)
+        ipni (get (json-body (ipq/handle ctx (req "/ipq/v1"))) "ipni")]
+    (is (= 3148096 (get ipni "protocol")) "0x300940, the identifier on the wire")
+    (is (= "transport-ipq-selection-http" (get ipni "name")))
+    (is (= 2368 (get ipni "registrationRequest"))
+        "0x0940 -- the next free slot in the transport family, not announced")
+    (is (= {"from" 3145728 "to" 4194303} (get ipni "privateUseArea"))
+        "0x300000-0x3FFFFF")
+    (is (<= (get-in ipni ["privateUseArea" "from"])
+            (get ipni "protocol")
+            (get-in ipni ["privateUseArea" "to"]))
+        "announcing an unregistered code outside the private range would be
+         squatting on a registry we do not own")
+    (is (= (get ipni "protocol")
+           (+ (get-in ipni ["privateUseArea" "from"]) (get ipni "registrationRequest")))
+        "and the announced code is the private base plus the slot we would ask
+         for, so the ask and the announcement cannot drift apart")
+    (testing "the exact bytes an advertisement carries"
+      (is (= "c092c0010101" (get-in ipni ["metadata" "ipq"])))
+      (is (= "a01200c092c0010101" (get-in ipni ["metadata" "advertised"])))
+      (is (= (str (hex (uvarint (get ipni "protocol"))) "01" (hex [ipq/profile]))
+             (get-in ipni ["metadata" "ipq"]))
+          "identifier, a payload length of one, then the profile -- so a
+           profile bump that forgot these bytes goes red rather than
+           advertising IPQ/1 for a surface that is no longer IPQ/1")
+      (is (str/starts-with? (get-in ipni ["metadata" "advertised"]) "a01200")
+          "trustless gateway with a payload length of zero; go-libipni rejects
+           the two-byte form the spec's prose describes")
+      (is (str/ends-with? (get-in ipni ["metadata" "advertised"])
+                          (get-in ipni ["metadata" "ipq"]))
+          "0x0920 < 0x300940, which is already the increasing protocol order
+           the spec asks for"))))
+
+;; ── Accept is answered, not ignored ─────────────────────────────────────────
+
+(defn accepting [r v] (assoc-in r [:headers "accept"] v))
+
+(deftest an-accept-we-cannot-satisfy-is-406-and-not-a-car-nobody-asked-for
+  ;; kotobase ADR-2609060000 asks for supported forms AND VERSIONS to be
+  ;; negotiated explicitly. Reading no request headers at all satisfies neither
+  ;; half: a client that asked for JSON got a CAR, and the only thing that said
+  ;; so was a content type on a body it had already decided it could not read.
+  (let [{:keys [root ctx]} (fixture)
+        path (str "/ipq/v1/selection/" root)
+        param (path-selector-param ["child" "title"])
+        ask (fn [accept]
+              (ipq/handle ctx (cond-> (req path param)
+                                accept (accepting accept))))]
+    (testing "served: nothing to refuse, a wildcard, or the type we make"
+      (doseq [a [nil "" "*/*" "application/*"
+                 "application/vnd.ipld.car"
+                 "APPLICATION/VND.IPLD.CAR"
+                 "application/vnd.ipld.car;version=1"
+                 "application/vnd.ipld.car;version=\"1\""
+                 "application/vnd.ipld.car; version=1; order=dfs; dups=y"
+                 "application/json, */*;q=0.1"]]
+        (is (= 200 (:status (ask a))) (str "Accept: " (pr-str a)))))
+    (testing "refused: a concrete type this surface does not make"
+      (doseq [a ["application/json"
+                 "application/vnd.ipld.raw"
+                 "text/html"
+                 "application/vnd.ipld.car;version=2"]]
+        (let [resp (ask a)]
+          (is (= 406 (:status resp)) (str "Accept: " (pr-str a)))
+          (is (= "accept-not-satisfiable" (get (json-body resp) "error"))
+              (str "Accept: " (pr-str a))))))
+    (testing "q=0 excludes rather than ranks, and specificity decides which q"
+      ;; `application/vnd.ipld.car;q=0, */*` says *anything but a CAR*. Reading
+      ;; it as any-match finds `*/*`, serves the CAR, and gets the client's one
+      ;; instruction exactly backwards. The excluded range in the second case
+      ;; never covered us, so the wildcard is the only one that speaks.
+      (is (= 406 (:status (ask "application/vnd.ipld.car;q=0, */*"))))
+      (is (= 406 (:status (ask "*/*;q=0"))))
+      (is (= 200 (:status (ask "application/json;q=0, */*")))))
+    (testing "HEAD negotiates too -- the same representation, minus the body"
+      (let [resp (ipq/handle ctx (accepting (req :head path param)
+                                            "application/json"))]
+        (is (= 406 (:status resp)))
+        (is (= "accept-not-satisfiable" (get (json-body resp) "error")))))
+    (testing "a request that is wrong twice reports the Accept, not the selector"
+      (let [resp (ipq/handle ctx (accepting (req path) "application/json"))]
+        (is (= 406 (:status resp)))
+        (is (= "accept-not-satisfiable" (get (json-body resp) "error")))
+        (is (not= "selector-required" (get (json-body resp) "error"))
+            "a client that cannot read the representation gains nothing from
+             being sent away to fix the smaller of its two problems")))
+    (testing "the descriptor is not negotiated: it is how you learn what to ask"
+      (let [resp (ipq/handle ctx (accepting (req "/ipq/v1")
+                                            "application/vnd.ipld.car"))]
+        (is (= 200 (:status resp)))
+        (is (= "ipq" (get (json-body resp) "protocol"))
+            "refusing to describe the surface because the client's Accept named
+             the surface's own media type would close the only way back out of
+             a wrong guess")))))

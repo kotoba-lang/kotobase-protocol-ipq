@@ -28,9 +28,15 @@
   would make a non-standard response indistinguishable from a standard one to
   a client that guessed wrong. `/ipq/v1/` says which protocol answered.
 
+  The rest of that sentence is `accepts-car?` and `ipni`: a form this surface
+  cannot produce is refused rather than answered with a CAR, and the descriptor
+  states the protocol identifier an index handed the client, so arriving at the
+  right address and arriving at the right protocol stop being two separate
+  acts of faith.
+
   ## Surface
 
-      GET  /ipq/v1                         profile, limits, encodings
+      GET  /ipq/v1                         profile, limits, encodings, identity
       GET  /ipq/v1/selection/{root-cid}?selector=<base64url dag-cbor>
       HEAD likewise
 
@@ -61,6 +67,53 @@
    :max-depth 32
    :max-matches 256})
 
+(def ipni
+  "The IPNI identity of this protocol, restated on the surface it identifies.
+
+  An index hands a client two things — a multicodec protocol identifier and an
+  address — and no promise that they belong together. Before this block a
+  client could decode `transport-ipq-selection-http` out of an advertisement,
+  follow the address, and find nothing at the other end that named the protocol
+  back; the only confirmation available was to send a selection and see whether
+  the answer looked like one. The descriptor now says which identifier this
+  surface answers for, which is the half of that handshake the surface owns.
+
+  The code looks unregistered because it is. `0x300940` sits in the multicodec
+  PRIVATE USE AREA (`0x300000`-`0x3FFFFF`, \"reserved for internal use by
+  applications\"), offset by `0x0940` — the next free slot in the registered
+  transport family (`0x0900` bitswap, `0x0910` graphsync, `0x0920`
+  ipfs-gateway-http, `0x0930` filecoin-piece-http) and therefore the code a
+  registration would ask for. Announcing an unregistered code OUTSIDE that
+  range would be squatting on a registry we do not own; announcing one inside
+  it is what the range is for, and a reader who does not know the code learns
+  that it is application-private rather than that the advertisement is
+  malformed. Both numbers are published because only one of them is on the
+  wire, and a client that saw `0x300940` and no explanation would have to guess
+  which registry it came from.
+
+  `metadata` is hex, and it is the framing an advertisement carries:
+  `uvarint(protocol) ++ uvarint(payload-length) ++ payload`. `ipq` is this
+  protocol's entry alone — length one, payload the profile number.
+  `advertised` is the whole Metadata field kotobase publishes, the trustless
+  gateway entry `a01200` first because `0x0920 < 0x300940` and the spec asks
+  for increasing protocol order.
+
+  AUTHORITY: `ipni.metadata` in kotoba-lang/io-ipni-specs — `ipq-selection-http`,
+  `ipq-selection-http-registration-request`, `ipq-selection-http-bytes` and
+  `kotobase-metadata-bytes`, where that framing was measured against go-libipni
+  v0.8.2 rather than read off IPNI.md's prose (the prose omits the length, and
+  the reference rejects what the prose describes). io-ipni-specs is NOT a
+  dependency here and must not become one: this is a pure handler with three
+  deps, and it advertises nothing — publishing is the deploy shell's business.
+  Two independent statements of one wire constant is the intended arrangement.
+  An undeclared drift between them is not, which is what `ipq_test.cljc` pins."
+  {"protocol" 0x300940
+   "name" "transport-ipq-selection-http"
+   "privateUseArea" {"from" 0x300000 "to" 0x3FFFFF}
+   "registrationRequest" 0x0940
+   "metadata" {"ipq" "c092c0010101"
+               "advertised" "a01200c092c0010101"}})
+
 (def descriptor
   {"protocol" "ipq"
    "profile" profile
@@ -71,6 +124,7 @@
              "maxBytes" (:max-bytes limits)
              "maxDepth" (:max-depth limits)
              "maxMatches" (:max-matches limits)}
+   "ipni" ipni
    "proves" "that this traversal ran over blocks that hash to their CIDs"
    "doesNotProve" "that a database range or Datalog answer is complete"})
 
@@ -106,6 +160,77 @@
                        (str/replace "=" ""))]
       (try (b/as-bytes (dag-json/base64-decode standard))
            (catch #?(:clj Exception :cljs :default) _ {:error :not-base64url})))))
+
+;; ── content negotiation ──────────────────────────────────────────────────────
+
+(defn- media-range
+  "One element of an `Accept` field, as a lower-cased type and its parameters.
+  Quotes are stripped, so `version=\"1\"` and `version=1` are one value."
+  [element]
+  (let [[head & params] (str/split element #";")]
+    {:type (str/lower-case (str/trim (or head "")))
+     :params (into {} (keep (fn [kv]
+                              (let [[k v] (str/split kv #"=" 2)]
+                                (when v
+                                  [(str/lower-case (str/trim k))
+                                   (str/lower-case (str/replace (str/trim v) "\"" ""))])))
+                            params))}))
+
+(defn- covers-car?
+  "Whether one parsed range covers the representation this surface makes.
+
+  `version` is the only parameter that can take it out of range, and it counts
+  because the descriptor publishes `response.car-version` — `version=2` is a
+  client asking, specifically, for something this surface does not build.
+  `order` and `dups` are the trustless gateway's parameters and are ignored
+  rather than refused: this is not a gateway, and turning every parameter that
+  registry grows into a 406 would be a surface that stops working on somebody
+  else's schedule."
+  [{:keys [type params]}]
+  (or (contains? #{"*/*" "application/*"} type)
+      (and (= trustless/content-type type)
+           (contains? #{nil "1"} (get params "version")))))
+
+(defn- specificity [{:keys [type]}]
+  (cond (= "*/*" type) 0
+        (str/ends-with? type "/*") 1
+        :else 2))
+
+(defn- excluded?
+  "A quality of zero. The only qvalue that changes the answer here: quality
+  ranks alternatives, and there is exactly one representation to rank, but
+  `q=0` is an exclusion rather than a ranking."
+  [{:keys [params]}]
+  (boolean (re-matches #"0(?:\.0*)?" (get params "q" "1"))))
+
+(defn accepts-car?
+  "Whether an `Accept` field admits the one representation this surface makes.
+
+  Until this existed the handler read no request headers at all: a client that
+  asked for JSON got a CAR, and the only thing that said so was a content type
+  on a body it had already decided it could not read. kotobase ADR-2609060000
+  asks for supported forms *and versions* to be negotiated explicitly, and a
+  concrete type we cannot produce is now a 406.
+
+  Absent or empty is served. RFC 9110 gives a request with no `Accept` the
+  whole space of representations, and a field that is present and empty ranks
+  nothing — there is no type in it to refuse.
+
+  Specificity is honoured rather than any-match, and that is the whole reason
+  this is a fold and not a `some`. `application/vnd.ipld.car;q=0, */*` means
+  *anything but a CAR*; an any-match reading finds `*/*`, serves the CAR, and
+  gets the client's one instruction exactly backwards. RFC 9110 ranks an exact
+  type above `type/*` above `*/*`, so the qvalue that decides is the one on the
+  most specific range that covers us — which also keeps
+  `application/json;q=0, */*` served, because the excluded range is not one
+  that covered us in the first place."
+  [accept]
+  (if (or (nil? accept) (str/blank? accept))
+    true
+    (let [covering (filter covers-car? (map media-range (str/split accept #",")))
+          best (when (seq covering) (apply max (map specificity covering)))]
+      (boolean (some #(and (= best (specificity %)) (not (excluded? %)))
+                     covering)))))
 
 (defn block-port
   "The `:blocks` port from `ctx`, or nil.
@@ -206,6 +331,11 @@
               "ctx must carry :blocks {:get (fn [cid] -> block | nil)}")
 
       (= ["ipq" "v1"] segs)
+      ;; Not negotiated, deliberately. The descriptor is how a client learns
+      ;; what to ask for, so refusing to describe the surface because the
+      ;; client's `Accept` named the surface's own media type would close the
+      ;; only way back out of a wrong guess. RFC 9110 lets a server disregard
+      ;; the field and answer anyway, and that is the reading taken.
       (json-resp 200 descriptor)
 
       (and (= 4 (count segs))
@@ -214,9 +344,21 @@
            (= "selection" (nth segs 2)))
       (let [root (nth segs 3)
             raw (http/query-param req "selector")]
-        (if (nil? raw)
+        (cond
+          (not (accepts-car? (http/header req "accept")))
+          ;; Ahead of the selector, and it decides the whole request: a client
+          ;; that cannot read the representation gains nothing from having its
+          ;; selector validated, and answering `selector-required` first would
+          ;; send it away to fix the smaller of its two problems.
+          (refuse 406 :accept-not-satisfiable
+                  (str "this surface produces " trustless/content-type
+                       " (CARv1) and nothing else; see GET /ipq/v1"))
+
+          (nil? raw)
           (refuse 400 :selector-required
                   "pass ?selector=<base64url dag-cbor>; see GET /ipq/v1")
+
+          :else
           (let [decoded (base64url->bytes raw)]
             (if (:error decoded)
               (refuse 400 :selector-not-base64url (name (:error decoded)))
