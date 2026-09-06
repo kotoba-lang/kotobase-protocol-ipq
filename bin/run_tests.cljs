@@ -1,0 +1,17 @@
+;; nbb test runner — the first-class runtime for this repo (root CLAUDE.md
+;; runtime priority). Run from the repo root:
+;;
+;;   nbb --classpath "$(clojure -Spath -A:test)" bin/run_tests.cljs
+;;
+;; A `.cljc` test belongs in BOTH lists below. Being required is not being run.
+(ns run-tests
+  (:require [cljs.test :as t]
+            [kotobase.protocols.ipq-test]))
+
+(defmethod t/report [:cljs.test/default :end-run-tests] [m]
+  (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
+                (:fail m) " failed, " (:error m) " errors"))
+  (when-not (t/successful? m)
+    (set! (.-exitCode js/process) 1)))
+
+(t/run-tests 'kotobase.protocols.ipq-test)

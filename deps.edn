@@ -1,0 +1,25 @@
+{:paths ["src"]
+ ;; src needs three things and no more: the block port and HTTP/JSON shapes
+ ;; from protocol-core, the selector and Data Model from io-ipld, and the CAR
+ ;; framing from io-ipld-car. Every pin below is a commit on that repo's
+ ;; default branch — an unmerged SHA is a dependency that disappears when its
+ ;; branch does (root CLAUDE.md, `deps.edn` pins have no `verify-west-pins`).
+ :deps {io.github.kotoba-lang/kotobase-protocol-core
+        {:git/sha "cf48a5fe743fb8fdc0fae19c8942b8ad64effdf4"}
+        io.github.kotoba-lang/io-ipld
+        {:git/sha "6fc39e62f558521669cf07e8b94e9bbf86ce503f"}
+        ;; Floor, not a preference: `ipld.car.trustless/replay-selection` and
+        ;; the bounded CARv2 index reads landed on 2026-09-06 and this surface
+        ;; is meaningless without the first of them — a CAR nobody can replay
+        ;; is not a proof.
+        io.github.kotoba-lang/io-ipld-car
+        {:git/sha "6a67a81f2c47e8dc5945c19d289a9043afdbb2eb"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "--fail-level" "error"]}}}
