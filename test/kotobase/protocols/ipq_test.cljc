@@ -51,6 +51,18 @@
 
 (defn json-body [resp] (json/parse (:body resp)))
 
+(defn unsigned
+  "Byte values as numbers, on both runtimes.
+
+  `(vec some-bytes)` is not this. `ipld.car.bytes/->bytes` produces the
+  runtime's native container, and a JVM `byte[]` is SIGNED: 0xFB reads back as
+  -5 there and as 251 on ClojureScript. Measured -- the first version of the
+  base64url test asserted `(= [0xFB 0xFF] (vec …))`, passed on nbb, and failed
+  on the JVM with `[-5 -1]`, which is the same two bytes. `bget` exists for
+  exactly this and its docstring says so."
+  [b]
+  (mapv #(bytes/bget b %) (range (bytes/bcount b))))
+
 ;; ── the descriptor is how a client learns the budget ─────────────────────────
 
 (deftest descriptor-publishes-the-profile-and-the-budgets
@@ -105,8 +117,8 @@
     ;; 0xFB 0xFF encodes as \"+_8\" in standard base64 and \"-_8\" in base64url.
     ;; Handing the raw parameter to a standard decoder would reject a correct
     ;; selector; stripping the unknown characters would decode a different one.
-    (is (= [0xFB 0xFF] (vec (ipq/base64url->bytes "-_8"))))
-    (is (= [0xFB 0xFF] (vec (ipq/base64url->bytes "-_8=")))
+    (is (= [0xFB 0xFF] (unsigned (ipq/base64url->bytes "-_8"))))
+    (is (= [0xFB 0xFF] (unsigned (ipq/base64url->bytes "-_8=")))
         "padding is optional and means the same thing"))
   (testing "a character outside the alphabet is an error, never dropped"
     (is (= :not-base64url (:error (ipq/base64url->bytes "ab*d"))))
