@@ -4,7 +4,12 @@
  ;; framing from io-ipld-car. Every pin below is a commit on that repo's
  ;; default branch — an unmerged SHA is a dependency that disappears when its
  ;; branch does (root CLAUDE.md, `deps.edn` pins have no `verify-west-pins`).
- :deps {;; Tracks protocol-core's `main` tip; it is not held back for a reason.
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       ;; Tracks protocol-core's `main` tip; it is not held back for a reason.
         ;; A reader who finds this behind the default branch should advance it
         ;; rather than look for the justification that would have to be written
         ;; here if it were deliberately frozen (root CLAUDE.md: a pin's default
