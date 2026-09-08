@@ -9,7 +9,8 @@
             [ipld.graph :as graph]
             [ipld.selector :as selector]
             [kotobase.protocols.ipq :as ipq]
-            [kotobase.protocols.json :as json]))
+            [kotobase.protocols.json :as json]
+            [multiformats.core]))
 
 ;; ── fixture ──────────────────────────────────────────────────────────────────
 
@@ -327,3 +328,85 @@
             "refusing to describe the surface because the client's Accept named
              the surface's own media type would close the only way back out of
              a wrong guess")))))
+
+;; ── a selector that reaches a RAW leaf ───────────────────────────────────────
+;;
+;; The shape of every DAG that carries bytes: a DAG-CBOR root whose links point
+;; at raw leaves. This surface answered HTTP 500 for it until io-ipld#35.
+;;
+;; Measured 2026-09-08 on `ipfs.kotobase.net/ipq/v1`, against a dag-cbor root
+;; over 36 raw leaves, with the SAME selector shape aimed one position at a
+;; time along one vector:
+;;
+;;   [0] a string  200      [1] a string  200
+;;   [2] the LINK  500      [3] a number  200
+;;
+;; The fault was two layers down -- `ipld/get-verified-block` re-addressed
+;; every block as dag-cbor -- and this handler was already correct: given the
+;; root alone it answered `404 missing-block` naming the leaf. That is why the
+;; regression guard lives here as well as there. This layer is where the 500
+;; was OBSERVED, and a floor in `deps.edn` is a claim about a version, not a
+;; check that the version does the thing.
+
+(defn raw-leaf-fixture
+  "A DAG-CBOR root linking a raw leaf and a dag-cbor leaf, so a failure that
+   takes out link-crossing entirely is distinguishable from one that takes out
+   raw."
+  []
+  (let [store (atom {})
+        put! (fn [cid block-bytes] (swap! store assoc cid block-bytes))
+        payload (ipld/encode {"payload" "bytes in a raw leaf"})
+        raw (multiformats.core/cidv1-raw payload)
+        _ (put! raw payload)
+        cbor (ipld/put-node! put! {"title" "cbor leaf"})
+        root (ipld/put-node! put! {"raw" (ipld/link raw) "cbor" (ipld/link cbor)})]
+    {:root root :raw raw :cbor cbor :payload payload
+     :ctx {:blocks {:get (fn [cid]
+                           (when-let [b (get @store cid)]
+                             {:bytes b}))
+                    :list (fn [] (keys @store))}}}))
+
+(deftest a-selector-reaching-a-raw-leaf-is-answered
+  (let [{:keys [ctx root raw payload]} (raw-leaf-fixture)
+        sel-bytes (selector/encode (graph/path-selector ["raw"]))
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
+                                  (base64url sel-bytes)))]
+    (is (= 200 (:status resp)))
+    ;; Replayed from the archive ALONE, which is the only check that says the
+    ;; CAR is an answer rather than a well-formed file. A 200 carrying just the
+    ;; root would be the original defect wearing a different status.
+    (let [replayed (trustless/replay-selection (body->car-bytes resp)
+                                               root sel-bytes ipq/limits)]
+      (is (= [root raw] (mapv :cid (:loaded replayed)))
+          "the raw leaf is in the archive and the traversal needed it")
+      (is (= 1 (count (:matches replayed))))
+      (is (= (unsigned payload) (unsigned (:value (first (:matches replayed)))))
+          "and the match is the leaf's bytes, not a decode of them")
+      (is (empty? (:unused replayed))))))
+
+(deftest a-selector-reaching-a-dag-cbor-leaf-is-still-answered
+  ;; The control. If the test above goes green because link-crossing stopped
+  ;; happening at all, this goes red with it.
+  (let [{:keys [ctx root cbor]} (raw-leaf-fixture)
+        sel-bytes (selector/encode (graph/path-selector ["cbor" "title"]))
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
+                                  (base64url sel-bytes)))]
+    (is (= 200 (:status resp)))
+    (let [replayed (trustless/replay-selection (body->car-bytes resp)
+                                               root sel-bytes ipq/limits)]
+      (is (= [root cbor] (mapv :cid (:loaded replayed))))
+      (is (= ["cbor leaf"] (mapv :value (:matches replayed)))))))
+
+(deftest a-raw-leaf-that-is-absent-is-still-named
+  ;; The refusal the async shell joins on: it fetches the CID this names and
+  ;; runs the handler again. If it stopped naming one, the shell would have
+  ;; nothing to fetch and the surface would 404 a block it holds.
+  (let [{:keys [ctx root raw]} (raw-leaf-fixture)
+        without-raw (assoc-in ctx [:blocks :get]
+                              (let [get-fn (get-in ctx [:blocks :get])]
+                                (fn [cid] (when (not= cid raw) (get-fn cid)))))
+        resp (ipq/handle without-raw (req (str "/ipq/v1/selection/" root)
+                                          (path-selector-param ["raw"])))]
+    (is (= 404 (:status resp)))
+    (is (= "missing-block" (get (json-body resp) "error")))
+    (is (= raw (get (json-body resp) "detail")))))

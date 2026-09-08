@@ -11,8 +11,16 @@
         ;; state is the upstream default-branch tip).
         io.github.kotoba-lang/kotobase-protocol-core
         {:git/sha "ca3874d2dababed63bb1c357722c8a38e4a3a812"}
+        ;; Floor, not a preference. Before 2200e3c0 `ipld/get-verified-block`
+        ;; threw `block codec is not dag-cbor` for every other codec, so
+        ;; `ipld.graph` -- this handler's traversal core -- could not cross a
+        ;; link into a RAW block. Raw is the ordinary shape of a byte leaf, and
+        ;; the live surface answered HTTP 500 for exactly that selector while
+        ;; answering 200 for a string one position away (measured 2026-09-08,
+        ;; io-ipld#35). Below this SHA the handler is correct and the traversal
+        ;; under it is not.
         io.github.kotoba-lang/io-ipld
-        {:git/sha "6fc39e62f558521669cf07e8b94e9bbf86ce503f"}
+        {:git/sha "2200e3c0c93b459c097ce0f3a02cb08f2e4f8a04"}
         ;; Floor, not a preference: `ipld.car.trustless/replay-selection` and
         ;; the bounded CARv2 index reads landed on 2026-09-06 and this surface
         ;; is meaningless without the first of them — a CAR nobody can replay
