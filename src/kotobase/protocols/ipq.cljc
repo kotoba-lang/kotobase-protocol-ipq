@@ -43,7 +43,7 @@
   Handlers are pure: `(handle ctx req) -> resp`, over the block port injected
   in `ctx` as `:blocks {:get (fn [cid] -> block | nil)}` — required, see
   `block-port`. No network I/O, no host JSON, no crypto dependency."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [ipld.car.bytes :as b]
             [ipld.car.trustless :as trustless]
             [ipld.dag-json :as dag-json]
@@ -168,12 +168,12 @@
   Quotes are stripped, so `version=\"1\"` and `version=1` are one value."
   [element]
   (let [[head & params] (str/split element #";")]
-    {:type (str/lower-case (str/trim (or head "")))
+    {:type (str/lower (str/trim (or head "")))
      :params (into {} (keep (fn [kv]
                               (let [[k v] (str/split kv #"=" 2)]
                                 (when v
-                                  [(str/lower-case (str/trim k))
-                                   (str/lower-case (str/replace (str/trim v) "\"" ""))])))
+                                  [(str/lower (str/trim k))
+                                   (str/lower (str/replace (str/trim v) "\"" ""))])))
                             params))}))
 
 (defn- covers-car?
