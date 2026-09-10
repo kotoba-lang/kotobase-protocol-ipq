@@ -294,7 +294,29 @@
   question about content we do not hold, not a fault. `:ipld/resource-limit`
   is 413 and never a truncated 200 — a budget exhausted mid-traversal is an
   incomplete retrieval, and an incomplete retrieval that returns 200 is the
-  failure this whole surface exists to avoid."
+  failure this whole surface exists to avoid.
+
+  `:ipld/unsupported-codec` is 501, added 2026-09-11 after the live surface
+  answered a Cloudflare HTML 500 for it (error 1101, Worker threw exception).
+  It is not 4xx: the CID is well formed and the block is held — the same CID
+  is served by `/ipni/v1/ad/`. It is not 502 either, which this file uses for
+  a store that handed back something undecodable. The block is fine and this
+  PROFILE does not implement verification for its codec, which is what 501
+  says. `ipld.core/get-verified-block` owns which codecs those are and puts
+  the set in its ex-data, so the detail below quotes it rather than restating
+  it here — a second list would be a second source of truth for a fact one
+  library already owns, which is the drift this file avoids elsewhere.
+
+  **The default branch no longer re-throws, and that was the defect.** The
+  sentence this docstring opens with — map EVERY failure onto a status — was
+  false for exactly one branch, and inside a Worker a re-throw is not an
+  unhandled exception a caller can read: it is an HTML page from the edge with
+  none of this surface's named refusals in it. An unknown failure now gets its
+  own status and its own name, so a caller can still tell it apart from every
+  other answer, and the ex-data type travels with it so it stays diagnosable.
+  What does NOT travel is the exception message: every other refusal here
+  quotes a message this file raised itself, and an unknown exception is the one
+  case where nothing has vetted what that string contains."
   [ctx req root selector-data]
   (try
     (let [result (trustless/selection-car (block-bytes ctx) root selector-data limits)]
@@ -312,7 +334,12 @@
           :ipld/invalid-selector (refuse 400 :invalid-selector (ex-message e))
           :ipq/unsupported-block-encoding
           (refuse 502 :unsupported-block-encoding (str (:encoding (ex-data e))))
-          (throw e))))))
+          :ipld/unsupported-codec
+          (let [{:keys [cid codec supported]} (ex-data e)]
+            (refuse 501 :codec-not-supported
+                    (str cid " declares codec " codec
+                         "; this profile verifies " (pr-str (sort supported)))))
+          (refuse 500 :unhandled (str "ex-data type: " (pr-str t))))))))
 
 (defn handle
   "IPQ/1 handler. `GET /ipq/v1` describes the profile; `GET|HEAD
