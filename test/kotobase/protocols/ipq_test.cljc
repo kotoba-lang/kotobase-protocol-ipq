@@ -410,3 +410,103 @@
     (is (= 404 (:status resp)))
     (is (= "missing-block" (get (json-body resp) "error")))
     (is (= raw (get (json-body resp) "detail")))))
+
+;; ── codecs this profile does not verify ──────────────────────────────────────
+;;
+;; Measured on the live surface 2026-09-10 (root ADR-2609109900): a selection
+;; whose root block is dag-json answered HTTP 500 with a Cloudflare HTML page
+;; (error 1101, Worker threw exception), because `selection` re-threw every
+;; ex-data type its `case` did not name. `ipld.core/get-verified-block` had
+;; already been raising a named `:ipld/unsupported-codec` for a year of shas;
+;; nothing here listened for it.
+;;
+;; The same shape took the surface out once before, from the other side: before
+;; io-ipld `2200e3c0` a RAW leaf was unverifiable and the surface 500ed on it
+;; (io-ipld#35, 2026-09-08). That was fixed by making raw verifiable. This one
+;; cannot be fixed that way -- dag-json needs another decoder -- so it is fixed
+;; by answering.
+
+(def ^:private dag-json-codec 0x0129)
+
+(defn foreign-codec-fixture
+  "A DAG-CBOR root linking one block whose CID declares a codec this profile
+   cannot re-address, and one ordinary dag-cbor leaf beside it. The sibling is
+   what tells a failure of link-crossing apart from a failure of THIS codec."
+  []
+  (let [store (atom {})
+        put! (fn [cid block-bytes] (swap! store assoc cid block-bytes))
+        payload (ipld/encode {"payload" "bytes under a foreign codec"})
+        foreign (multiformats.core/cidv1 dag-json-codec
+                                         (multiformats.core/multihash-sha256 payload))
+        _ (put! foreign payload)
+        cbor (ipld/put-node! put! {"title" "cbor leaf"})
+        root (ipld/put-node! put! {"foreign" (ipld/link foreign)
+                                   "cbor" (ipld/link cbor)})]
+    {:root root :foreign foreign :cbor cbor :payload payload
+     :ctx {:blocks {:get (fn [cid]
+                           (when-let [b (get @store cid)]
+                             {:bytes b}))
+                    :list (fn [] (keys @store))}}}))
+
+(deftest a-root-whose-codec-this-profile-cannot-verify-is-refused-by-name
+  (let [{:keys [ctx foreign]} (foreign-codec-fixture)
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" foreign)
+                                  (base64url (selector/encode {:selector :matcher}))))]
+    (is (= 501 (:status resp))
+        "not 500: an HTML page from the edge is none of this surface's answers")
+    (is (= "codec-not-supported" (get (json-body resp) "error")))
+    (let [detail (get (json-body resp) "detail")]
+      (is (str/includes? detail foreign) "the detail names the CID that was refused")
+      (is (str/includes? detail (str dag-json-codec))
+          "and the codec it declares, so a caller can tell WHICH codec was refused"))))
+
+(deftest a-link-into-a-codec-this-profile-cannot-verify-is-refused-by-name
+  ;; The root is fine here and the traversal reaches the foreign block by
+  ;; crossing a link, which is the path the live failure actually took: nothing
+  ;; about the request named the codec.
+  (let [{:keys [ctx root foreign]} (foreign-codec-fixture)
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
+                                  (path-selector-param ["foreign"])))]
+    (is (= 501 (:status resp)))
+    (is (= "codec-not-supported" (get (json-body resp) "error")))
+    (is (str/includes? (get (json-body resp) "detail") foreign))))
+
+(deftest a-dag-cbor-sibling-of-a-foreign-codec-is-still-answered
+  ;; The control. If the two tests above went green because this fixture
+  ;; refuses everything, this one goes red with them.
+  (let [{:keys [ctx root cbor]} (foreign-codec-fixture)
+        sel-bytes (selector/encode (graph/path-selector ["cbor" "title"]))
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
+                                  (base64url sel-bytes)))]
+    (is (= 200 (:status resp)))
+    (let [replayed (trustless/replay-selection (body->car-bytes resp)
+                                               root sel-bytes ipq/limits)]
+      (is (= [root cbor] (mapv :cid (:loaded replayed))))
+      (is (= ["cbor leaf"] (mapv :value (:matches replayed)))))))
+
+(deftest a-failure-this-handler-does-not-know-still-gets-a-status-and-a-name
+  ;; The regression test for the defect itself, which was not the missing codec
+  ;; branch but the DEFAULT branch: `(throw e)`. Anything unrecognised left the
+  ;; Worker as an exception, and a caller got an HTML page instead of one of
+  ;; this surface's refusals.
+  ;;
+  ;; The port throws only for the leaf, never for the root: the root lookup
+  ;; happens OUTSIDE `selection`'s try, so a port that threw on everything
+  ;; would prove nothing about this branch.
+  (let [{:keys [ctx root cbor]} (foreign-codec-fixture)
+        get-fn (get-in ctx [:blocks :get])
+        exploding (assoc-in ctx [:blocks :get]
+                            (fn [cid]
+                              (if (= cid cbor)
+                                (throw (ex-info "something no branch names"
+                                                {:type :test/not-a-known-failure}))
+                                (get-fn cid))))
+        resp (ipq/handle exploding (req (str "/ipq/v1/selection/" root)
+                                        (path-selector-param ["cbor"])))]
+    (is (= 500 (:status resp)))
+    (is (= "unhandled" (get (json-body resp) "error"))
+        "named, so a caller can tell it from every other answer this surface gives")
+    (is (str/includes? (get (json-body resp) "detail") ":test/not-a-known-failure")
+        "and the ex-data type travels, so it stays diagnosable")
+    (is (not (str/includes? (get (json-body resp) "detail") "something no branch names"))
+        "but the message does not: nothing has vetted what an unknown exception says")))
