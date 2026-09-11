@@ -67,6 +67,30 @@
    :max-depth 32
    :max-matches 256})
 
+(def unpacked-limits
+  "The budget for a traversal whose root has no pack behind it.
+
+  Measured 2026-09-11 on the live surface with a 256-block graph, same root
+  both ways (com-junkawasaki/root ADR-2609109900 Q3e): with a CARv2 pack the
+  full 256 answered in 338 ms with one fetch; without one it answered in
+  36.3 s p50 and 46.0 s p90, one fetch per block, 98% of it waiting on the
+  block plane. Both completed. So `limits` above is DELIVERABLE at 256 and
+  usable only through a pack -- and a ceiling that admits a 46-second request
+  on the other path is not a ceiling, it is the absence of one.
+
+  32 is the widest measured width under five seconds on that path (4.2 s p50,
+  6.6 s p90), and it is also the width the one real graph on this origin has
+  (the IPNI advertisement chain, every link, 32 blocks). Everything else is
+  `limits`: bytes, depth and matches are bounded by the same numbers, because
+  it is the block COUNT that costs a round trip each.
+
+  The pure handler does not know what a pack is; the deploy shell does, and
+  it passes these as `:limits` in the ctx after the first miss comes back
+  without one. Published in the descriptor as `maxBlocksWithoutPack`, for the
+  same reason `limits` is published: a client that cannot read the budget
+  can only discover it by being refused."
+  (assoc limits :max-blocks 32))
+
 (def ipni
   "The IPNI identity of this protocol, restated on the surface it identifies.
 
@@ -121,6 +145,7 @@
                "parameter" "selector"}
    "response" {"content-type" trustless/content-type "car-version" 1}
    "limits" {"maxBlocks" (:max-blocks limits)
+             "maxBlocksWithoutPack" (:max-blocks unpacked-limits)
              "maxBytes" (:max-bytes limits)
              "maxDepth" (:max-depth limits)
              "maxMatches" (:max-matches limits)}
@@ -319,7 +344,8 @@
   case where nothing has vetted what that string contains."
   [ctx req root selector-data]
   (try
-    (let [result (trustless/selection-car (block-bytes ctx) root selector-data limits)]
+    (let [result (trustless/selection-car (block-bytes ctx) root selector-data
+                                          (get ctx :limits limits))]
       (-> (car-resp req (get-in result [:car :bytes]))
           (assoc :body-encoding :base64)
           (update :headers assoc

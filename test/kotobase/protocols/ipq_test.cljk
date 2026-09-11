@@ -542,3 +542,57 @@
         "and the ex-data type travels, so it stays diagnosable")
     (is (not (str/includes? (get (json-body resp) "detail") "something no branch names"))
         "but the message does not: nothing has vetted what an unknown exception says")))
+
+;; ── two ceilings, and which one a request is under ───────────────────────────
+;;
+;; Measured 2026-09-11 (root ADR-2609109900 Q3e): 256 blocks answer in 338 ms
+;; behind a pack and in 36 s p50 / 46 s p90 without one. The handler cannot
+;; know which case it is in -- a pack is the shell's concept -- so it takes
+;; the budget per request from `ctx` and publishes both numbers.
+
+(defn- wide-fixture
+  "A root linking `n` leaves, so a traversal can be made exactly as wide as a
+   ceiling and one past it."
+  [n]
+  (let [store (atom {})
+        put! (fn [cid b] (swap! store assoc cid b))
+        leaves (mapv (fn [i] (ipld/put-node! put! {"i" i})) (range n))
+        root (ipld/put-node! put! {"leaves" (mapv ipld/link leaves)})]
+    {:root root :ctx {:blocks {:get (fn [cid] (when-let [b (get @store cid)] {:bytes b}))
+                               :list (fn [] (keys @store))}}}))
+
+(defn- all-leaves-param []
+  (base64url (selector/encode {:selector :explore-fields
+                               :fields {"leaves" {:selector :explore-all
+                                                  :next {:selector :matcher}}}})))
+
+(deftest the-descriptor-publishes-both-ceilings
+  (let [limits (get ipq/descriptor "limits")]
+    (is (= 256 (get limits "maxBlocks")))
+    (is (= 32 (get limits "maxBlocksWithoutPack")))
+    (is (< (get limits "maxBlocksWithoutPack") (get limits "maxBlocks"))
+        "the unpacked ceiling is the lower one, or advertising it would be noise")))
+
+(deftest without-limits-in-ctx-the-published-limits-apply
+  ;; 33 blocks is over the unpacked ceiling and well under the full one.
+  (let [{:keys [root ctx]} (wide-fixture 32)
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root) (all-leaves-param)))]
+    (is (= 200 (:status resp)))
+    (is (= "33" (get-in resp [:headers "x-ipq-blocks"])))))
+
+(deftest with-unpacked-limits-in-ctx-the-same-traversal-is-refused-by-name
+  (let [{:keys [root ctx]} (wide-fixture 32)
+        resp (ipq/handle (assoc ctx :limits ipq/unpacked-limits)
+                         (req (str "/ipq/v1/selection/" root) (all-leaves-param)))]
+    (is (= 413 (:status resp)) "a budget exhausted mid-traversal is never a truncated 200")
+    (is (= "resource-limit" (get (json-body resp) "error")))
+    (is (str/includes? (get (json-body resp) "detail") "max-blocks")
+        "and the refusal names the budget that was hit")))
+
+(deftest under-the-unpacked-ceiling-the-narrower-budget-still-answers
+  ;; The control: 32 blocks exactly, at the ceiling and not over it.
+  (let [{:keys [root ctx]} (wide-fixture 31)
+        resp (ipq/handle (assoc ctx :limits ipq/unpacked-limits)
+                         (req (str "/ipq/v1/selection/" root) (all-leaves-param)))]
+    (is (= 200 (:status resp)))
+    (is (= "32" (get-in resp [:headers "x-ipq-blocks"])))))
