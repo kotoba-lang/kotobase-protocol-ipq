@@ -178,7 +178,7 @@ from a server fault.
 
 ```bash
 clojure -M:test                                        # JVM
-nbb --classpath "$(clojure -Spath -A:test)" bin/run_tests.cljs   # nbb (first-class)
+nbb --classpath "$(clojure -Spath -A:test)" bin/run_tests.cljk   # nbb (first-class)
 ```
 
 Both halves run the same `.cljc`.
