@@ -24,8 +24,14 @@
         ;; answering 200 for a string one position away (measured 2026-09-08,
         ;; io-ipld#35). Below this SHA the handler is correct and the traversal
         ;; under it is not.
+        ;; 9bf07ce7 (2026-09-11) lifts the second version of that same
+        ;; failure: a block whose CID declares dag-json is now verified under
+        ;; its own codec and decoded, so a traversal crosses into it instead of
+        ;; raising `:ipld/unsupported-codec` -- which this handler had, until
+        ;; the day before, re-thrown as a Cloudflare 500. Below this SHA the
+        ;; refusal is named correctly and the traversal still stops there.
         io.github.kotoba-lang/io-ipld
-        {:git/sha "2200e3c0c93b459c097ce0f3a02cb08f2e4f8a04"}
+        {:git/sha "9bf07ce7894d1162842099f3f1e0ced252b82de9"}
         ;; Floor, not a preference: `ipld.car.trustless/replay-selection` and
         ;; the bounded CARv2 index reads landed on 2026-09-06 and this surface
         ;; is meaningless without the first of them — a CAR nobody can replay
