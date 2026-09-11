@@ -1,7 +1,7 @@
 ;; nbb test runner — the first-class runtime for this repo (root CLAUDE.md
 ;; runtime priority). Run from the repo root:
 ;;
-;;   nbb --classpath "$(clojure -Spath -A:test)" bin/run_tests.cljk
+;;   kbb --backend sci --classpath "$(kbb -Spath -A:test)" bin/run_tests.cljk
 ;;
 ;; A `.cljc` test belongs in BOTH lists below. Being required is not being run.
 (ns run-tests
