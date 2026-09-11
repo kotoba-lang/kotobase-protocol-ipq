@@ -426,8 +426,6 @@
 ;; cannot be fixed that way -- dag-json needs another decoder -- so it is fixed
 ;; by answering.
 
-(def ^:private dag-json-codec 0x0129)
-
 (defn foreign-codec-fixture
   "A DAG-CBOR root linking one block whose CID declares a codec this profile
    cannot re-address, and one ordinary dag-cbor leaf beside it. The sibling is
@@ -435,9 +433,12 @@
   []
   (let [store (atom {})
         put! (fn [cid block-bytes] (swap! store assoc cid block-bytes))
-        payload (ipld/encode {"payload" "bytes under a foreign codec"})
-        foreign (multiformats.core/cidv1 dag-json-codec
-                                         (multiformats.core/multihash-sha256 payload))
+        ;; Genuine canonical DAG-JSON, not CBOR bytes under a dag-json CID:
+        ;; the decoder round-trips what it reads, so the latter would be
+        ;; refused as :not-canonical and this fixture would test the wrong
+        ;; thing. The address is the codec's own `cid`, over its own bytes.
+        payload (dag-json/encode {"payload" "bytes under a foreign codec"})
+        foreign (dag-json/cid payload)
         _ (put! foreign payload)
         cbor (ipld/put-node! put! {"title" "cbor leaf"})
         root (ipld/put-node! put! {"foreign" (ipld/link foreign)
@@ -448,8 +449,50 @@
                              {:bytes b}))
                     :list (fn [] (keys @store))}}}))
 
-(deftest a-root-whose-codec-this-profile-cannot-verify-is-refused-by-name
+;; 2026-09-11, one day later: io-ipld 9bf07ce7 decodes dag-json, so the two
+;; tests that pinned the 501 for it are now the two that pin the 200. The
+;; fixture's foreign block is genuine canonical DAG-JSON for that reason -- a
+;; block that merely DECLARED the codec over CBOR bytes would be refused by the
+;; decoder's round trip, and would test the wrong thing. The 501 path is kept
+;; alive below by a codec that still has no decoder here (dag-pb, 0x70).
+
+(deftest a-dag-json-root-is-now-answered
   (let [{:keys [ctx foreign]} (foreign-codec-fixture)
+        sel-bytes (selector/encode (graph/path-selector ["payload"]))
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" foreign)
+                                  (base64url sel-bytes)))]
+    (is (= 200 (:status resp)) "yesterday's 501, lifted by the decoder one repo down")
+    (let [replayed (trustless/replay-selection (body->car-bytes resp)
+                                               foreign sel-bytes ipq/limits)]
+      (is (= [foreign] (mapv :cid (:loaded replayed))))
+      (is (= ["bytes under a foreign codec"] (mapv :value (:matches replayed)))
+          "and the value INSIDE the dag-json block is what the archive replays to"))))
+
+(deftest a-link-into-a-dag-json-block-is-now-crossed
+  ;; The path the live failure took: a dag-cbor root, a link, and nothing in
+  ;; the request naming the codec. Depth 14 of the IPNI chain, in miniature.
+  (let [{:keys [ctx root foreign]} (foreign-codec-fixture)
+        sel-bytes (selector/encode (graph/path-selector ["foreign" "payload"]))
+        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
+                                  (base64url sel-bytes)))]
+    (is (= 200 (:status resp)))
+    (let [replayed (trustless/replay-selection (body->car-bytes resp)
+                                               root sel-bytes ipq/limits)]
+      (is (= [root foreign] (mapv :cid (:loaded replayed))) "root, then across the link")
+      (is (= ["bytes under a foreign codec"] (mapv :value (:matches replayed)))))))
+
+(def ^:private dag-pb-codec 0x70)
+
+(deftest a-codec-with-no-decoder-is-still-refused-by-name
+  ;; The 501 path did not go away with dag-json; it moved to the codecs that
+  ;; genuinely have no decoder here. dag-pb is one, and io-ipld says why.
+  (let [store (atom {})
+        payload (ipld/encode {"payload" "bytes under dag-pb"})
+        foreign (multiformats.core/cidv1 dag-pb-codec
+                                         (multiformats.core/multihash-sha256 payload))
+        _ (swap! store assoc foreign payload)
+        ctx {:blocks {:get (fn [cid] (when-let [b (get @store cid)] {:bytes b}))
+                      :list (fn [] (keys @store))}}
         resp (ipq/handle ctx (req (str "/ipq/v1/selection/" foreign)
                                   (base64url (selector/encode {:selector :matcher}))))]
     (is (= 501 (:status resp))
@@ -457,19 +500,8 @@
     (is (= "codec-not-supported" (get (json-body resp) "error")))
     (let [detail (get (json-body resp) "detail")]
       (is (str/includes? detail foreign) "the detail names the CID that was refused")
-      (is (str/includes? detail (str dag-json-codec))
+      (is (str/includes? detail (str dag-pb-codec))
           "and the codec it declares, so a caller can tell WHICH codec was refused"))))
-
-(deftest a-link-into-a-codec-this-profile-cannot-verify-is-refused-by-name
-  ;; The root is fine here and the traversal reaches the foreign block by
-  ;; crossing a link, which is the path the live failure actually took: nothing
-  ;; about the request named the codec.
-  (let [{:keys [ctx root foreign]} (foreign-codec-fixture)
-        resp (ipq/handle ctx (req (str "/ipq/v1/selection/" root)
-                                  (path-selector-param ["foreign"])))]
-    (is (= 501 (:status resp)))
-    (is (= "codec-not-supported" (get (json-body resp) "error")))
-    (is (str/includes? (get (json-body resp) "detail") foreign))))
 
 (deftest a-dag-cbor-sibling-of-a-foreign-codec-is-still-answered
   ;; The control. If the two tests above went green because this fixture
