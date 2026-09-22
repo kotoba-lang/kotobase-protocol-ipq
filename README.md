@@ -62,6 +62,17 @@ IPQ/1 CAR → replay selector and verify CIDs
 (ipq-fs/provider-registry mount)
 ;; => {34 {:request-type :string :result-type :string :invoke ...}
 ;;     35 {:request-type :string :result-type :string :invoke ...}}
+
+;; A long-lived host can reuse verification by explicit CID-scoped cache.
+;; Reuse the same capability value: capability identity is part of the key.
+(def cache (ipq-fs/create-mount-cache 16))
+(def identity {:root expected-root
+               :scope-root "/workspace"
+               :adl-capability snapshot-adl})
+(or (ipq-fs/lookup-mount cache identity) ; before network access
+    (ipq-fs/mount-cached cache
+                         (assoc identity :car-bytes (fetch-ipq-car expected-root))))
+;; receipt :cache is :miss on verification and :hit on reuse.
 ```
 
 The mount accepts exactly one root match and rejects unused CAR blocks. The ADL
@@ -72,6 +83,10 @@ duplicates and unknown fields are refused, and total entries/content are
 bounded. The provider is read-only and currently implements the operations
 needed by `find` and `grep`: browse, full text read, `EXISTS`, and `STAT`.
 `RANGE` and `WRITE` are named refusals, not accidental pathname reads.
+Directory children are sorted and indexed once at mount time, so recursive
+browse is linear in the visited tree rather than entries × directories. The
+cache is bounded and explicit rather than process-global; call `mount` directly
+when every newly supplied CAR must itself be audited for unused blocks.
 
 ## What a 200 from here means, exactly
 
@@ -224,6 +239,14 @@ from a server fault.
 ```bash
 kbb -M:test                                        # JVM
 kbb --backend sci --classpath "$(kbb -Spath -A:test)" bin/run_tests.cljk   # nbb (first-class)
+```
+
+The filesystem provider's cache and recursive-browse costs have a reproducible
+SCI benchmark.  It prints EDN medians and includes the pre-index browse algorithm
+as its control:
+
+```bash
+kbb --backend sci --classpath "$(clojure -Spath)" bench/ipq_fs.cljk
 ```
 
 Both halves run the same `.cljc`.

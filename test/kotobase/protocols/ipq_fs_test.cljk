@@ -34,8 +34,8 @@
       (str/replace "/" "_")
       (str/replace "=" "")))
 
-(defn fixture []
-  (let [representation (ipld/encode snapshot)
+(defn fixture-for [logical]
+  (let [representation (ipld/encode logical)
         root (mf/cidv1-raw representation)
         ctx {:blocks {:get (fn [cid]
                              (when (= cid root)
@@ -48,6 +48,8 @@
                               :query {"selector" (base64url fs/snapshot-selector-bytes)}})
         car-bytes (bytes/as-bytes (dag-json/base64-decode (:body response)))]
     {:root root :response response :car-bytes car-bytes}))
+
+(defn fixture [] (fixture-for snapshot))
 
 (defn mounted []
   (let [{:keys [root car-bytes]} (fixture)]
@@ -134,3 +136,45 @@
            (problem #(attempt (update snapshot "entries" conj
                                       {"path" "/workspace/missing/child"
                                        "type" "file" "text" "no"})))))))
+
+(deftest verified-mount-cache-is-explicit-bounded-and-capability-scoped
+  (let [{:keys [root car-bytes]} (fixture)
+        decodes (atom 0)
+        capability (assoc (snapshot-adl) :decode
+                          (fn [value] (swap! decodes inc) (ipld/decode value)))
+        options {:car-bytes car-bytes :root root :scope-root "/workspace"
+                 :adl-capability capability}
+        cache (fs/create-mount-cache 1)]
+    (is (= :miss (get-in (fs/mount-cached cache options) [:receipt :cache])))
+    (let [after-miss @decodes]
+      (is (pos? after-miss))
+      (is (= :hit
+             (get-in (fs/lookup-mount cache (dissoc options :car-bytes)) [:receipt :cache])))
+      (is (= after-miss @decodes) "a cache hit does not replay CAR or ADL work"))
+    (is (= :unknown-option
+           (problem #(fs/mount-cached cache (assoc options :unreviewed true))))
+        "a hit cannot bypass exact mount-option validation")
+    (testing "a different capability identity cannot reuse the verified result"
+      (is (= :miss
+             (get-in (fs/mount-cached cache (assoc options :adl-capability (snapshot-adl)))
+                     [:receipt :cache]))))
+    (testing "capacity one evicted the original capability-scoped entry"
+      (is (nil? (fs/lookup-mount cache (dissoc options :car-bytes))))
+      (is (= :miss (get-in (fs/mount-cached cache options) [:receipt :cache]))))))
+
+(deftest declared-entry-limit-is-reachable-before-adl-output-budget
+  (letfn [(logical [file-count]
+            {"version" 1
+             "entries"
+             (into [{"path" "/workspace" "type" "directory"}]
+                   (map (fn [i] {"path" (str "/workspace/f" i)
+                                 "type" "file" "text" ""})
+                        (range file-count)))})
+          (attempt [file-count]
+            (let [{:keys [root car-bytes]} (fixture-for (logical file-count))]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl)})))]
+    (is (= 4096 (count (:entries (attempt 4095))))
+        "the documented 4096-entry ceiling is admitted")
+    (is (= :entry-limit (problem #(attempt 4096)))
+        "the next entry is refused by the named logical limit")))
