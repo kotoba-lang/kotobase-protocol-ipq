@@ -1,0 +1,43 @@
+(ns kotobase.protocols.ipq-fs-cli-test
+  (:require [cljs.test :refer [deftest is]]
+            [kotobase.protocols.ipq.fs-cli :as cli]
+            [kotobase.protocols.ipq-fs-test :as fixture]))
+
+(def node-fs (js/require "node:fs"))
+(def node-path (js/require "node:path"))
+(def node-os (js/require "node:os"))
+
+(defn problem [f]
+  (try (do (f) nil)
+       (catch :default e (:problem (ex-data e)))))
+
+(deftest materialize-command-produces-a-real-read-only-tree
+  (let [{:keys [root car-bytes]} (fixture/fixture)
+        temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-cli-"))
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")]
+    (try
+      (.writeFileSync node-fs car-file car-bytes)
+      (let [receipt (cli/run! ["materialize" "--car" car-file "--root" root
+                               "--scope-root" "/workspace"
+                               "--cache-root" cache-root])
+            local-root (:local-root receipt)
+            materialized (.join node-path local-root "docs" "readme.txt")]
+        (is (= :materialized (:status receipt)))
+        (is (= 4 (:entries receipt)))
+        (is (= 2 (:files receipt)))
+        (is (= "alpha\nbeta\nalpha\n" (.readFileSync node-fs materialized "utf8")))
+        (is (= 292 (bit-and 511 (.-mode (.statSync node-fs materialized))))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest command-refuses-ambiguous-input
+  (is (= :command (problem #(cli/parse-args []))))
+  (is (= :required-option (problem #(cli/parse-args ["materialize" "--root" "bafkqaaa"]))))
+  (is (= :unknown-option
+         (problem #(cli/parse-args ["materialize" "--car" "x" "--root" "bafkqaaa"
+                                    "--write" "yes"]))))
+  (is (= :duplicate-option
+         (problem #(cli/parse-args ["materialize" "--car" "x" "--car" "y"
+                                    "--root" "bafkqaaa"])))))
