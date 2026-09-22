@@ -23,6 +23,7 @@
 (def ^:const app-data-provider-id 35)
 (def ^:const adl-name "KotobaFsSnapshot")
 (def ^:const snapshot-version 1)
+(def ^:const default-cache-capacity 16)
 
 (def limits
   "The logical expansion budget after IPQ's own four traversal budgets.
@@ -35,7 +36,10 @@
    :adl {:max-depth 32
          :max-nodes 16384
          :max-adl-fuel 1000000
-         :max-adl-output-nodes 16384
+         ;; One exact file entry occupies seven logical nodes (map, three
+         ;; keys, three values).  16,384 therefore rejected an otherwise
+         ;; valid snapshot before :max-entries=4096 could make the decision.
+         :max-adl-output-nodes 32768
          :max-adl-output-bytes 4194304
          :check-adl-determinism? true}})
 
@@ -148,7 +152,15 @@
         (when (> content-bytes (:max-content-bytes limits))
           (fail! :content-limit "IPQ filesystem snapshot exceeds the content limit"
                  {:maximum (:max-content-bytes limits) :actual content-bytes})))
-      by-path)))
+      {:by-path by-path
+       :children-by-parent
+       (reduce-kv
+        (fn [index path entry]
+          (if-let [parent (parent-path path)]
+            (update index parent (fnil conj []) entry)
+            index))
+        {}
+        by-path)})))
 
 (defn- assert-request-path! [mount path]
   (when-not (canonical-path? path)
@@ -159,15 +171,35 @@
            {:scope-root (:scope-root mount) :path path}))
   path)
 
+(def ^:private mount-option-keys
+  #{:car-bytes :root :selector-bytes :scope-root :adl-capability})
+
+(defn- assert-mount-identity-options!
+  [{:keys [root scope-root adl-capability] :or {scope-root "/"} :as options}]
+  (when-not (every? mount-option-keys (keys options))
+    (fail! :unknown-option "IPQ filesystem mount options are not exact"
+           {:keys (set (keys options))}))
+  (when-not (and (string? root) (map? adl-capability))
+    (fail! :mount-identity
+           "IPQ filesystem mount identity requires root and ADL capability" {}))
+  (when-not (canonical-path? scope-root)
+    (fail! :scope-root "IPQ filesystem scope root is not canonical"
+           {:scope-root scope-root}))
+  options)
+
+(defn- assert-mount-options! [{:keys [car-bytes] :as options}]
+  (assert-mount-identity-options! options)
+  (when-not car-bytes
+    (fail! :mount-input "IPQ filesystem mount requires CAR bytes" {}))
+  options)
+
 (defn browse
   "Wire-34 response for one directory in a mounted IPQ snapshot."
   [mount path]
   (assert-request-path! mount path)
   (when-not (= "directory" (get-in mount [:entries path "type"]))
     (fail! :not-directory "fs/browse target is not a directory" {:path path}))
-  (->> (vals (:entries mount))
-       (filter #(= path (parent-path (get % "path"))))
-       (sort-by #(get % "path"))
+  (->> (get (:children-by-parent mount) path [])
        (map (fn [entry]
               (str (base-name (get entry "path")) "\t"
                    (if (= "directory" (get entry "type")) "1" "0"))))
@@ -221,6 +253,75 @@
    app-data-provider-id {:request-type :string :result-type :string
                          :invoke #(app-data mount %)}})
 
+(declare mount)
+
+(defn create-mount-cache
+  "Create a bounded cache for already verified immutable mounts.
+
+  Cache instances are explicit so hosts choose the trust and lifetime boundary;
+  there is no process-global cache.  Eviction is FIFO and capacity is exact."
+  ([] (create-mount-cache default-cache-capacity))
+  ([capacity]
+   (when-not (and (integer? capacity) (pos? capacity))
+     (fail! :cache-capacity "IPQ filesystem mount cache capacity must be positive"
+            {:capacity capacity}))
+   {:format :kotobase.ipq/fs-mount-cache-v1
+    :capacity capacity
+    :state (atom {:order [] :mounts {}})}))
+
+(defn- cache-key [{:keys [root selector-bytes scope-root adl-capability]
+                   :or {selector-bytes snapshot-selector-bytes scope-root "/"}}]
+  ;; Capability identity belongs in the key.  The same ADL name/version does
+  ;; not prove that two host implementations have identical semantics.
+  [root (vec (bytes/as-bytes selector-bytes)) scope-root adl-capability])
+
+(defn- assert-cache! [cache]
+  (when-not (and (map? cache)
+                 (= :kotobase.ipq/fs-mount-cache-v1 (:format cache))
+                 (integer? (:capacity cache)) (pos? (:capacity cache))
+                 #?(:clj (instance? clojure.lang.IAtom (:state cache))
+                    :cljs (satisfies? IAtom (:state cache))))
+    (fail! :mount-cache "IPQ filesystem mount cache is not valid" {}))
+  cache)
+
+(defn lookup-mount
+  "Look up a verified mount before fetching a CAR; return nil on cache miss.
+
+  `options` requires root and the same selector, scope, and exact ADL capability
+  that will be passed to `mount-cached`. `:car-bytes` is optional and ignored."
+  [cache options]
+  (assert-cache! cache)
+  (assert-mount-identity-options! options)
+  (when-let [cached (get-in @(:state cache) [:mounts (cache-key options)])]
+    (assoc-in cached [:receipt :cache] :hit)))
+
+(defn mount-cached
+  "Return a verified mount from an explicit bounded cache, or verify and cache it.
+
+  A hit deliberately does not replay the supplied CAR: the requested root is a
+  content identity and the cached value has already been verified under the same
+  selector, scope, and exact ADL capability.  Call `mount` when every supplied
+  CAR itself must be audited (for example to reject newly appended unused blocks)."
+  [cache options]
+  (assert-cache! cache)
+  (assert-mount-options! options)
+  (let [key (cache-key options)
+        state (:state cache)]
+    (if-let [cached (lookup-mount cache options)]
+      cached
+      (let [verified (mount options)]
+        (swap! state
+               (fn [{:keys [order mounts]}]
+                 (if (contains? mounts key)
+                   {:order order :mounts mounts}
+                   (let [order' (conj order key)
+                         mounts' (assoc mounts key verified)
+                         overflow (- (count order') (:capacity cache))
+                         evicted (if (pos? overflow) (subvec order' 0 overflow) [])]
+                     {:order (if (pos? overflow) (subvec order' overflow) order')
+                      :mounts (apply dissoc mounts' evicted)}))))
+        (assoc-in verified [:receipt :cache] :miss)))))
+
 (defn mount
   "Verify an IPQ/1 CAR, decode its one raw match through the versioned ADL, and
   return an immutable read-only filesystem mount.
@@ -232,16 +333,7 @@
   [{:keys [car-bytes root selector-bytes scope-root adl-capability]
     :or {selector-bytes snapshot-selector-bytes scope-root "/"}
     :as options}]
-  (when-not (= (set (keys options))
-               (set (filter #(contains? options %)
-                            [:car-bytes :root :selector-bytes :scope-root :adl-capability])))
-    (fail! :unknown-option "IPQ filesystem mount options are not exact"
-           {:keys (set (keys options))}))
-  (when-not (and car-bytes (string? root) (map? adl-capability))
-    (fail! :mount-input "IPQ filesystem mount requires CAR bytes, root, and ADL capability" {}))
-  (when-not (canonical-path? scope-root)
-    (fail! :scope-root "IPQ filesystem scope root is not canonical"
-           {:scope-root scope-root}))
+  (assert-mount-options! options)
   (let [replayed (trustless/replay-selection (bytes/as-bytes car-bytes)
                                              root selector-bytes ipq/limits)
         matches (:matches replayed)]
@@ -254,12 +346,17 @@
     (let [decoded (schema/representation->logical!
                    compiled-snapshot-schema "Snapshot" (:value (first matches))
                    (assoc (:adl limits) :adl-capabilities {adl-name adl-capability}))
-          entries (validate-snapshot! scope-root (:logical-value decoded))]
+          {:keys [by-path children-by-parent]}
+          (validate-snapshot! scope-root (:logical-value decoded))]
       {:format :kotobase.ipq/fs-mount-v1
        :ipq-profile ipq/profile
        :root root
        :scope-root scope-root
-       :entries entries
+       :entries by-path
+       :children-by-parent
+       (into {} (map (fn [[parent children]]
+                       [parent (vec (sort-by (fn [entry] (get entry "path")) children))]))
+             children-by-parent)
        :receipt {:loaded (mapv :cid (:loaded replayed))
                  :selector-bytes selector-bytes
                  :adl-name adl-name
