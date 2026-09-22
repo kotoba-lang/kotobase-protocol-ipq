@@ -122,6 +122,40 @@ does not apply to a mutable worktree. Use the workspace's normal local/indexed
 tools there; a CID snapshot and a live checkout are different consistency
 contracts.
 
+### Git project and team contract
+
+A team shares snapshot identity in the project, not the generated cache. Commit
+this strict manifest as `.kotoba/ipq.edn`:
+
+```clojure
+{:schema "kotoba.ipq.git-project.v1"
+ :snapshots
+ {"docs" {:root "<root-cid>"
+           :scope-root "/workspace"}}}
+```
+
+Then every teammate or agent can materialize the same named snapshot from the
+same Git commit:
+
+```bash
+kbb --backend sci bin/ipq_fs_materialize.cljk \
+  git-materialize --project /path/to/project --snapshot docs \
+  --car /tmp/selection.car
+```
+
+Git mode resolves the repository top level, reads the manifest from
+`HEAD:.kotoba/ipq.edn`, and records the full commit SHA, project, manifest, and
+snapshot name in the receipt. An untracked or modified manifest is refused;
+unrelated worktree changes are allowed because they cannot change the committed
+snapshot identity. `--root` and `--scope-root` are refused in this mode so a
+toolcall cannot silently override the team's reviewed values.
+
+The CAR remains an explicit local input and the verified tree remains under the
+per-user cache. Do not add either to Git. Git distributes the small declarative
+identity; IPQ distributes content-addressed bytes; the local materializer owns
+the generated read-only tree. A project can name multiple snapshots without
+sharing developer-specific cache paths or credentials.
+
 ## What a 200 from here means, exactly
 
 The body is a CARv1 holding the blocks a bounded IPLD selector touched, root

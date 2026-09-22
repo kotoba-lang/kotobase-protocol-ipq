@@ -1,10 +1,17 @@
 (ns kotobase.protocols.ipq.fs-cli
   "Agent/toolcall entrypoint for materializing one verified IPQ filesystem CAR."
-  (:require [ipld.car.bytes :as bytes]
+  (:require [cljs.reader :as reader]
+            [clojure.string :as str]
+            [ipld.car.bytes :as bytes]
             [ipld.core :as ipld]
             [kotobase.protocols.ipq.fs :as fs]))
 
 (def node-fs (js/require "node:fs"))
+(def node-path (js/require "node:path"))
+(def child-process (js/require "node:child_process"))
+
+(def git-manifest-path ".kotoba/ipq.edn")
+(def git-manifest-schema "kotoba.ipq.git-project.v1")
 
 (defn snapshot-adl-capability []
   {:version fs/snapshot-version
@@ -23,35 +30,122 @@
   {"--car" :car
    "--root" :root
    "--scope-root" :scope-root
-   "--cache-root" :cache-root})
+   "--cache-root" :cache-root
+   "--project" :project
+   "--snapshot" :snapshot})
+
+(def command-options
+  {"materialize" #{:car :root :scope-root :cache-root}
+   "git-materialize" #{:car :project :snapshot :cache-root}})
 
 (defn refuse! [problem message data]
   (throw (ex-info message (assoc data :phase :ipq-fs-cli :problem problem))))
 
 (defn parse-args [argv]
-  (when-not (= "materialize" (first argv))
-    (refuse! :command
-             "usage: ipq_fs_materialize.cljk materialize --car FILE --root CID [--scope-root /PATH] [--cache-root DIR]"
-             {:argv argv}))
-  (loop [remaining (next argv) options {}]
-    (if (empty? remaining)
-      (do
-        (when-not (and (string? (:car options)) (string? (:root options)))
-          (refuse! :required-option "--car and --root are required" {:options (keys options)}))
-        (assoc options :scope-root (or (:scope-root options) "/")))
-      (let [[flag value & more] remaining
-            option (get option-spec flag)]
-        (when-not option
-          (refuse! :unknown-option "unknown IPQ filesystem materialize option" {:option flag}))
-        (when-not (and value (not (.startsWith value "--")))
-          (refuse! :option-value "IPQ filesystem materialize option requires a value"
-                   {:option flag}))
-        (when (contains? options option)
-          (refuse! :duplicate-option "IPQ filesystem materialize option was repeated"
-                   {:option flag}))
-        (recur more (assoc options option value))))))
+  (let [command (first argv)
+        allowed (get command-options command)]
+    (when-not allowed
+      (refuse! :command
+               (str "usage: ipq_fs_materialize.cljk "
+                    "materialize --car FILE --root CID [--scope-root /PATH] [--cache-root DIR]\n"
+                    "   or: ipq_fs_materialize.cljk git-materialize --project DIR --snapshot NAME --car FILE [--cache-root DIR]")
+               {:argv argv}))
+    (loop [remaining (next argv) options {:command command}]
+      (if (empty? remaining)
+        (do
+          (case command
+            "materialize"
+            (when-not (and (string? (:car options)) (string? (:root options)))
+              (refuse! :required-option "--car and --root are required"
+                       {:options (keys options)}))
 
-(defn materialize! [{:keys [car root scope-root cache-root]}]
+            "git-materialize"
+            (when-not (and (string? (:car options))
+                           (string? (:project options))
+                           (string? (:snapshot options)))
+              (refuse! :required-option "--car, --project, and --snapshot are required"
+                       {:options (keys options)})))
+          (cond-> options
+            (= "materialize" command) (assoc :scope-root (or (:scope-root options) "/"))))
+        (let [[flag value & more] remaining
+              option (get option-spec flag)]
+          (when-not option
+            (refuse! :unknown-option "unknown IPQ filesystem materialize option" {:option flag}))
+          (when-not (contains? allowed option)
+            (refuse! :option-not-allowed "option is not valid for this materialize mode"
+                     {:command command :option flag}))
+          (when-not (and value (not (.startsWith value "--")))
+            (refuse! :option-value "IPQ filesystem materialize option requires a value"
+                     {:option flag}))
+          (when (contains? options option)
+            (refuse! :duplicate-option "IPQ filesystem materialize option was repeated"
+                     {:option flag}))
+          (recur more (assoc options option value)))))))
+
+(defn git-output! [project args problem message]
+  (try
+    (str/trim
+     (.execFileSync child-process "git" (clj->js (concat ["-C" project] args))
+                    #js {:encoding "utf8"
+                         :stdio #js ["ignore" "pipe" "pipe"]}))
+    (catch :default e
+      (refuse! problem message
+               {:project project
+                :git-args (vec args)
+                :git-exit-code (.-status e)}))))
+
+(defn exact-keys? [value expected]
+  (and (map? value) (= expected (set (keys value)))))
+
+(defn snapshot-entry? [entry]
+  (and (exact-keys? entry #{:root :scope-root})
+       (string? (:root entry)) (not (str/blank? (:root entry)))
+       (string? (:scope-root entry)) (.startsWith (:scope-root entry) "/")))
+
+(defn read-git-snapshot! [{:keys [project snapshot]}]
+  (let [project (.resolve node-path project)
+        top (git-output! project ["rev-parse" "--show-toplevel"]
+                         :git-project "--project is not inside a Git worktree")
+        commit (git-output! top ["rev-parse" "HEAD"]
+                            :git-head "Git project has no readable HEAD")
+        status (git-output! top ["status" "--porcelain" "--" git-manifest-path]
+                            :git-status "could not inspect the IPQ project manifest")]
+    (when-not (str/blank? status)
+      (refuse! :git-manifest-dirty
+               "the project IPQ manifest must be committed and unchanged"
+               {:git-project top :manifest git-manifest-path :status status}))
+    (let [source (git-output! top ["show" (str commit ":" git-manifest-path)]
+                              :git-manifest "HEAD does not contain .kotoba/ipq.edn")
+          manifest (try (reader/read-string source)
+                        (catch :default _
+                          (refuse! :git-manifest-syntax
+                                   "HEAD:.kotoba/ipq.edn is not readable EDN"
+                                   {:git-project top :git-commit commit})))
+          entry (get (:snapshots manifest) snapshot)]
+      (when-not (exact-keys? manifest #{:schema :snapshots})
+        (refuse! :git-manifest-shape "IPQ project manifest has unknown or missing fields"
+                 {:git-project top :git-commit commit}))
+      (when-not (= git-manifest-schema (:schema manifest))
+        (refuse! :git-manifest-schema "unsupported IPQ project manifest schema"
+                 {:expected git-manifest-schema :actual (:schema manifest)}))
+      (when-not (and (map? (:snapshots manifest))
+                     (every? #(and (string? %) (not (str/blank? %)))
+                             (keys (:snapshots manifest)))
+                     (every? snapshot-entry? (vals (:snapshots manifest))))
+        (refuse! :git-manifest-shape
+                 "IPQ project snapshots must map non-empty string names to exact root/scope entries"
+                 {:git-project top :git-commit commit}))
+      (when-not entry
+        (refuse! :git-snapshot "named IPQ snapshot is not present in HEAD:.kotoba/ipq.edn"
+                 {:snapshot snapshot :git-project top :git-commit commit}))
+      {:root (:root entry)
+       :scope-root (:scope-root entry)
+       :git-project top
+       :git-commit commit
+       :git-snapshot snapshot
+       :git-manifest git-manifest-path})))
+
+(defn materialize! [{:keys [car root scope-root cache-root] :as options}]
   (when cache-root
     (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) cache-root))
   (let [mount (fs/mount {:car-bytes (.readFileSync node-fs car)
@@ -60,15 +154,18 @@
                          :adl-capability (snapshot-adl-capability)})
         files (count (filter (fn [[_ entry]] (= "file" (get entry "type")))
                              (:entries mount)))]
-    {:status :materialized
-     :ipq-profile (:ipq-profile mount)
-     :root (:root mount)
-     :scope-root (:scope-root mount)
-     :local-root (:local-root mount)
-     :entries (count (:entries mount))
-     :files files
-     :loaded (get-in mount [:receipt :loaded])}))
+    (merge {:status :materialized
+            :ipq-profile (:ipq-profile mount)
+            :root (:root mount)
+            :scope-root (:scope-root mount)
+            :local-root (:local-root mount)
+            :entries (count (:entries mount))
+            :files files
+            :loaded (get-in mount [:receipt :loaded])}
+           (select-keys options [:git-project :git-commit :git-snapshot :git-manifest]))))
 
 (defn run! [argv]
-  (materialize! (parse-args argv)))
-
+  (let [{:keys [command] :as options} (parse-args argv)]
+    (case command
+      "materialize" (materialize! options)
+      "git-materialize" (materialize! (merge options (read-git-snapshot! options))))))

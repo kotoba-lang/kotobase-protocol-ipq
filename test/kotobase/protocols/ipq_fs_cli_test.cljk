@@ -6,6 +6,11 @@
 (def node-fs (js/require "node:fs"))
 (def node-path (js/require "node:path"))
 (def node-os (js/require "node:os"))
+(def child-process (js/require "node:child_process"))
+
+(defn git! [project & args]
+  (.execFileSync child-process "git" (clj->js (concat ["-C" project] args))
+                 #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]}))
 
 (defn problem [f]
   (try (do (f) nil)
@@ -40,4 +45,58 @@
                                     "--write" "yes"]))))
   (is (= :duplicate-option
          (problem #(cli/parse-args ["materialize" "--car" "x" "--car" "y"
+                                    "--root" "bafkqaaa"]))))
+  (is (= :option-not-allowed
+         (problem #(cli/parse-args ["git-materialize" "--project" "."
+                                    "--snapshot" "docs" "--car" "x"
                                     "--root" "bafkqaaa"])))))
+
+(deftest git-project-manifest-is-shared-identity-not-shared-cache
+  (let [{:keys [root car-bytes]} (fixture/fixture)
+        temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-git-"))
+        project (.join node-path temp "project")
+        metadata-dir (.join node-path project ".kotoba")
+        manifest (.join node-path metadata-dir "ipq.edn")
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")]
+    (try
+      (.mkdirSync node-fs metadata-dir #js {:recursive true})
+      (.writeFileSync node-fs car-file car-bytes)
+      (.writeFileSync node-fs manifest
+                      (pr-str {:schema cli/git-manifest-schema
+                               :snapshots {"docs" {:root root
+                                                   :scope-root "/workspace"}}}))
+      (git! project "init" "-b" "main")
+      (git! project "config" "user.name" "IPQ Test")
+      (git! project "config" "user.email" "ipq-test@example.invalid")
+      (git! project "add" cli/git-manifest-path)
+      (git! project "commit" "-m" "Track IPQ snapshot identity")
+      ;; Other worktree changes do not alter the committed IPQ identity.
+      (.writeFileSync node-fs (.join node-path project "notes.txt") "local only\n")
+      (let [receipt (cli/run! ["git-materialize" "--project" project
+                               "--snapshot" "docs" "--car" car-file
+                               "--cache-root" cache-root])
+            expected-commit (.trim (git! project "rev-parse" "HEAD"))]
+        (is (= :materialized (:status receipt)))
+        (is (= (.realpathSync node-fs project) (:git-project receipt)))
+        (is (= expected-commit (:git-commit receipt)))
+        (is (= "docs" (:git-snapshot receipt)))
+        (is (= cli/git-manifest-path (:git-manifest receipt)))
+        (is (= "alpha\nbeta\nalpha\n"
+               (.readFileSync node-fs
+                              (.join node-path (:local-root receipt) "docs" "readme.txt")
+                              "utf8"))))
+      (.writeFileSync node-fs manifest
+                      (pr-str {:schema cli/git-manifest-schema :snapshots {}}))
+      (is (= :git-manifest-dirty
+             (problem #(cli/run! ["git-materialize" "--project" project
+                                  "--snapshot" "docs" "--car" car-file
+                                  "--cache-root" cache-root]))))
+      (git! project "restore" cli/git-manifest-path)
+      (is (= :git-snapshot
+             (problem #(cli/run! ["git-materialize" "--project" project
+                                  "--snapshot" "missing" "--car" car-file
+                                  "--cache-root" cache-root]))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
