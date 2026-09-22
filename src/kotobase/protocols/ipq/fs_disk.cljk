@@ -1,0 +1,171 @@
+(ns kotobase.protocols.ipq.fs-disk
+  "Node/SCI disk materialization for verified immutable IPQ filesystem mounts.")
+
+(def node-fs (js/require "node:fs"))
+(def node-path (js/require "node:path"))
+(def node-os (js/require "node:os"))
+(def crypto (js/require "node:crypto"))
+(def max-cache-roots 16)
+
+(defn- fail! [problem message data]
+  (throw (ex-info message (assoc data :phase :ipq-fs-disk :problem problem))))
+
+(defn cache-root []
+  (or (.. js/process -env -KOTOBA_IPQ_FS_CACHE)
+      (.join node-path (.homedir node-os) ".cache" "kotoba" "ipq-fs" "v1")))
+
+(defn- digest [text]
+  (-> (.createHash crypto "sha256") (.update text "utf8") (.digest "hex")))
+
+(defn- relative-path [scope path]
+  (if (= scope path) "" (subs path (inc (count scope)))))
+
+(defn- local-path [root scope path]
+  (let [relative (relative-path scope path)]
+    (if (= "" relative) root (.join node-path root relative))))
+
+(defn- regular-file? [path]
+  (try (let [s (.lstatSync node-fs path)] (and (.isFile s) (not (.isSymbolicLink s))))
+       (catch :default _ false)))
+
+(defn- validate-existing! [target root]
+  (let [receipt-path (.join node-path target "receipt.json")]
+    (when-not (regular-file? receipt-path)
+      (fail! :cache-receipt "disk cache has no regular receipt" {:target target}))
+    (let [receipt (js->clj (js/JSON.parse (.readFileSync node-fs receipt-path "utf8"))
+                           :keywordize-keys true)]
+      (when-not (and (= 1 (:version receipt)) (= root (:root receipt)))
+        (fail! :cache-identity "disk cache receipt identity does not match" {:target target}))
+      (doseq [{:keys [path sha256 size]} (:files receipt)
+              :let [file (.join node-path target "tree" path)]]
+        (when-not (regular-file? file)
+          (fail! :cache-file "disk cache file is missing or not regular" {:path path}))
+        (let [text (.readFileSync node-fs file "utf8")]
+          (when-not (and (= size (.-byteLength (js/Buffer.from text "utf8")))
+                         (= sha256 (digest text)))
+            (fail! :cache-digest "disk cache file digest does not match receipt" {:path path}))))
+      receipt)))
+
+(defn- make-writable! [root]
+  (when (.existsSync node-fs root)
+    (let [stat (.lstatSync node-fs root)]
+      (when (.isSymbolicLink stat)
+        (fail! :cache-symlink "refusing to follow a symlink during cache eviction" {:path root}))
+      (if (.isDirectory stat)
+        (do (.chmodSync node-fs root 493)
+            (doseq [name (js->clj (.readdirSync node-fs root))]
+              (make-writable! (.join node-path root name))))
+        (.chmodSync node-fs root 420)))))
+
+(defn- evict! [base keep]
+  (let [candidates
+        (->> (js->clj (.readdirSync node-fs base #js {:withFileTypes true}))
+             (filter (fn [entry] (and (.isDirectory entry)
+                                      (not= (.-name entry) keep)
+                                      (not (.startsWith (.-name entry) ".staging-")))))
+             (map (fn [entry]
+                    (let [path (.join node-path base (.-name entry))]
+                      {:path path :mtime (.-mtimeMs (.statSync node-fs path))})))
+             (sort-by :mtime))]
+    (doseq [{:keys [path]} (take (max 0 (- (inc (count candidates)) max-cache-roots)) candidates)]
+      (make-writable! path)
+      (.rmSync node-fs path #js {:recursive true :force true}))))
+
+(defn- expected-files [mount]
+  (into {}
+        (keep (fn [[path entry]]
+                (when (= "file" (get entry "type"))
+                  (let [text (get entry "text")
+                        relative (relative-path (:scope-root mount) path)]
+                    [relative {:path relative
+                               :size (.-byteLength (js/Buffer.from text "utf8"))
+                               :sha256 (digest text)}]))))
+        (:entries mount)))
+
+(defn materialize
+  "Atomically materialize VERIFIED-MOUNT and return a disk-backed mount.
+  The verified logical value exists only during this call; returned file entries
+  contain metadata, not text."
+  [verified-mount]
+  (let [root (:root verified-mount)
+        _ (when-not (re-matches #"[A-Za-z0-9]+" root)
+            (fail! :cache-key "CID is not safe as a cache directory name" {:root root}))
+        base (cache-root)
+        target (.join node-path base root)
+        tree (.join node-path target "tree")]
+    (.mkdirSync node-fs base #js {:recursive true :mode 448})
+    (if (.existsSync node-fs target)
+      (validate-existing! target root)
+      (let [staging (.join node-path base
+                           (str ".staging-" root "-" (.-pid js/process) "-"
+                                (.toString (.randomBytes crypto 6) "hex")))
+            staging-tree (.join node-path staging "tree")]
+        (try
+          (.mkdirSync node-fs staging-tree #js {:recursive true :mode 448})
+          (doseq [[path entry] (sort-by first (:entries verified-mount))]
+            (let [destination (local-path staging-tree (:scope-root verified-mount) path)]
+              (if (= "directory" (get entry "type"))
+                (.mkdirSync node-fs destination #js {:recursive true :mode 448})
+                (do (.mkdirSync node-fs (.dirname node-path destination)
+                                #js {:recursive true :mode 448})
+                    (.writeFileSync node-fs destination (get entry "text")
+                                    #js {:encoding "utf8" :mode 292})))))
+          (let [files (vec (vals (expected-files verified-mount)))]
+            (.writeFileSync node-fs (.join node-path staging "receipt.json")
+                            (js/JSON.stringify (clj->js {:version 1 :root root :files files}))
+                            #js {:encoding "utf8" :mode 292}))
+          (doseq [[path entry] (:entries verified-mount)
+                  :when (= "directory" (get entry "type"))]
+            (.chmodSync node-fs (local-path staging-tree (:scope-root verified-mount) path) 365))
+          (.chmodSync node-fs staging-tree 365)
+          (.chmodSync node-fs staging 365)
+          (try (.renameSync node-fs staging target)
+               (catch :default e
+                 (if (.existsSync node-fs target)
+                   (do (make-writable! staging)
+                       (.rmSync node-fs staging #js {:recursive true :force true})
+                       (validate-existing! target root))
+                   (throw e))))
+          (catch :default e
+            (when (.existsSync node-fs staging)
+              (try (make-writable! staging) (catch :default _ nil))
+              (.rmSync node-fs staging #js {:recursive true :force true}))
+            (throw e)))))
+    (evict! base root)
+    (let [receipt (validate-existing! target root)
+          received (into {} (map (juxt :path identity)) (:files receipt))
+          expected (expected-files verified-mount)]
+      (when-not (= expected received)
+        (fail! :cache-receipt-mismatch
+               "disk cache receipt does not match the CID-verified snapshot" {:target target}))
+      (assoc verified-mount
+             :format :kotobase.ipq/fs-disk-mount-v1
+             :local-root tree
+             :disk-files received
+             :entries (into {} (map (fn [[path entry]] [path (dissoc entry "text")]))
+                            (:entries verified-mount))
+             :children-by-parent
+             (into {} (map (fn [[parent children]]
+                             [parent (mapv (fn [entry] (dissoc entry "text")) children)]))
+                   (:children-by-parent verified-mount))))))
+
+(defn validate-mount! [mount]
+  (let [receipt (validate-existing! (.dirname node-path (:local-root mount)) (:root mount))
+        received (into {} (map (juxt :path identity)) (:files receipt))]
+    (when-not (= (:disk-files mount) received)
+      (fail! :cache-receipt-mismatch
+             "disk cache receipt changed after materialization" {:root (:root mount)})))
+  mount)
+
+(defn read-text [mount path]
+  (let [relative (relative-path (:scope-root mount) path)
+        expected (get (:disk-files mount) relative)
+        text (.readFileSync node-fs (local-path (:local-root mount) (:scope-root mount) path) "utf8")]
+    (when-not (and expected
+                   (= (:size expected) (.-byteLength (js/Buffer.from text "utf8")))
+                   (= (:sha256 expected) (digest text)))
+      (fail! :cache-digest "disk cache file changed after materialization" {:path path}))
+    text))
+
+(defn stat-size [mount path]
+  (.-size (.statSync node-fs (local-path (:local-root mount) (:scope-root mount) path))))

@@ -1,6 +1,6 @@
 (ns kotobase.protocols.ipq-fs-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
-               :cljs [cljs.test :refer [deftest is testing]])
+               :cljs [cljs.test :refer [deftest is testing use-fixtures]])
             [ipld.car.bytes :as bytes]
             [ipld.car :as car]
             [ipld.core :as ipld]
@@ -9,6 +9,29 @@
             [kotobase.protocols.ipq :as ipq]
             [kotobase.protocols.ipq.fs :as fs]
             [multiformats.core :as mf]))
+
+#?(:cljs (def node-fs-test (js/require "node:fs")))
+#?(:cljs (def node-path-test (js/require "node:path")))
+#?(:cljs (def node-crypto-test (js/require "node:crypto")))
+#?(:cljs
+   (defn test-make-writable! [path]
+     (when (.existsSync node-fs-test path)
+       (let [stat (.lstatSync node-fs-test path)]
+         (if (.isDirectory stat)
+           (do (.chmodSync node-fs-test path 493)
+               (doseq [name (js->clj (.readdirSync node-fs-test path))]
+                 (test-make-writable! (.join node-path-test path name))))
+           (.chmodSync node-fs-test path 420))))))
+
+#?(:cljs
+   (let [node-os (js/require "node:os")
+         root (.join node-path-test (.tmpdir node-os) (str "ipq-fs-test-" (.-pid js/process)))]
+     (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) root)
+     (use-fixtures :once
+       (fn [run]
+         (try (run)
+              (finally (test-make-writable! root)
+                       (.rmSync node-fs-test root #js {:recursive true :force true})))))))
 
 (def snapshot
   {"version" 1
@@ -66,7 +89,18 @@
         mount (mounted)
         providers (fs/provider-registry mount)]
     (is (= 200 (:status response)) "the fixture really crossed the IPQ handler")
-    (is (= :kotobase.ipq/fs-mount-v1 (:format mount)))
+    (is (= #?(:clj :kotobase.ipq/fs-mount-v1
+              :cljs :kotobase.ipq/fs-disk-mount-v1)
+           (:format mount)))
+    #?(:cljs (do (is (string? (:local-root mount)))
+                 (is (nil? (get-in mount [:entries "/workspace/root.txt" "text"])))
+                 (is (every? #(nil? (get % "text"))
+                             (mapcat val (:children-by-parent mount))))
+                 (is (= "root 😀\n"
+                        (.readFileSync node-fs-test
+                                       (.join node-path-test (:local-root mount) "root.txt")
+                                       "utf8"))))
+       :clj nil)
     (is (= 1 (:ipq-profile mount)))
     (is (= [(:root mount)] (get-in mount [:receipt :loaded])))
     (is (true? (get-in mount [:receipt :adl-determinism-checked?])))
@@ -192,3 +226,33 @@
            ((get-in first-registry [34 :invoke]) "/workspace")))
     (is (= "alpha\nbeta\nalpha\n"
            ((get-in second-registry [35 :invoke]) "/workspace/docs/readme.txt")))))
+
+#?(:cljs
+   (deftest changed-disk-cache-file-is-refused
+     (let [logical (update snapshot "entries"
+                           (fn [entries]
+                             (mapv (fn [entry]
+                                     (if (= "/workspace/root.txt" (get entry "path"))
+                                       (assoc entry "text" "unique cache text") entry)) entries)))
+           {:keys [root car-bytes]} (fixture-for logical)
+           capability (snapshot-adl)
+           identity {:root root :scope-root "/workspace" :adl-capability capability}
+           cache (fs/create-mount-cache 1)
+           mount (fs/mount-cached cache (assoc identity :car-bytes car-bytes))
+           file (.join node-path-test (:local-root mount) "root.txt")]
+       (.chmodSync node-fs-test file 420)
+       (.writeFileSync node-fs-test file "tampered")
+       (is (= :cache-digest
+              (problem #(fs/app-data mount "/workspace/root.txt"))))
+       (let [receipt-path (.join node-path-test (.dirname node-path-test (:local-root mount))
+                                 "receipt.json")
+             receipt (js/JSON.parse (.readFileSync node-fs-test receipt-path "utf8"))
+             row (first (filter #(= "root.txt" (.-path %)) (array-seq (.-files receipt))))
+             sha (-> (.createHash node-crypto-test "sha256")
+                     (.update "tampered" "utf8") (.digest "hex"))]
+         (set! (.-size row) 8)
+         (set! (.-sha256 row) sha)
+         (.chmodSync node-fs-test receipt-path 420)
+         (.writeFileSync node-fs-test receipt-path (js/JSON.stringify receipt))
+         (is (= :cache-receipt-mismatch
+                (problem #(fs/lookup-mount cache identity))))))))
