@@ -100,6 +100,28 @@ directories are never published, symlinks are refused, and the oldest root is
 evicted after the bounded 16-root cache is exceeded. JVM use retains the pure
 in-memory mount until the same disk adapter is supplied for that host.
 
+### Agent and toolcall entrypoint
+
+An agent materializes an immutable IPQ snapshot once, then points ordinary
+local read tools at the returned `:local-root`. The command verifies the CAR,
+root CID, selector, ADL version, snapshot shape, and disk receipt before it
+prints a usable path:
+
+```bash
+kbb --backend sci bin/ipq_fs_materialize.cljk \
+  materialize --car /tmp/selection.car --root <root-cid> \
+  --scope-root /workspace
+# {:status :materialized, :local-root ".../<root-cid>/tree", ...}
+```
+
+`--cache-root DIR` overrides `KOTOBA_IPQ_FS_CACHE` for an isolated run. Unknown,
+missing, and repeated options are refused; failures print
+`REFUSE<TAB><problem><TAB><message>` and exit 2. The command never fetches the
+CAR itself: HTTP authority and authentication remain with the caller. It also
+does not apply to a mutable worktree. Use the workspace's normal local/indexed
+tools there; a CID snapshot and a live checkout are different consistency
+contracts.
+
 ## What a 200 from here means, exactly
 
 The body is a CARv1 holding the blocks a bounded IPLD selector touched, root
@@ -250,7 +272,7 @@ from a server fault.
 
 ```bash
 kbb -M:test                                        # JVM
-kbb --backend sci --classpath "$(kbb -Spath -A:test)" bin/run_tests.cljk   # nbb (first-class)
+kbb --backend sci bin/run_tests.cljk                  # SCI/Node (first-class)
 ```
 
 The filesystem provider's cache and recursive-browse costs have a reproducible
@@ -258,7 +280,7 @@ SCI benchmark.  It prints EDN medians and includes the pre-index browse algorith
 as its control:
 
 ```bash
-kbb --backend sci --classpath "$(clojure -Spath)" bench/ipq_fs.cljk
+kbb --backend sci bench/ipq_fs.cljk
 ```
 
 Both halves run the same `.cljc`.

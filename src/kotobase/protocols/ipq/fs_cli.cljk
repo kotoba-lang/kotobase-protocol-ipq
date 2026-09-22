@@ -1,0 +1,74 @@
+(ns kotobase.protocols.ipq.fs-cli
+  "Agent/toolcall entrypoint for materializing one verified IPQ filesystem CAR."
+  (:require [ipld.car.bytes :as bytes]
+            [ipld.core :as ipld]
+            [kotobase.protocols.ipq.fs :as fs]))
+
+(def node-fs (js/require "node:fs"))
+
+(defn snapshot-adl-capability []
+  {:version fs/snapshot-version
+   :validate-representation (fn [value]
+                              (try (do (bytes/bcount value) true)
+                                   (catch :default _ false)))
+   :decode ipld/decode
+   :encode ipld/encode
+   :validate-logical map?
+   :fuel-costs {:validate-representation 1
+                :decode 1
+                :encode 1
+                :validate-logical 1}})
+
+(def option-spec
+  {"--car" :car
+   "--root" :root
+   "--scope-root" :scope-root
+   "--cache-root" :cache-root})
+
+(defn refuse! [problem message data]
+  (throw (ex-info message (assoc data :phase :ipq-fs-cli :problem problem))))
+
+(defn parse-args [argv]
+  (when-not (= "materialize" (first argv))
+    (refuse! :command
+             "usage: ipq_fs_materialize.cljk materialize --car FILE --root CID [--scope-root /PATH] [--cache-root DIR]"
+             {:argv argv}))
+  (loop [remaining (next argv) options {}]
+    (if (empty? remaining)
+      (do
+        (when-not (and (string? (:car options)) (string? (:root options)))
+          (refuse! :required-option "--car and --root are required" {:options (keys options)}))
+        (assoc options :scope-root (or (:scope-root options) "/")))
+      (let [[flag value & more] remaining
+            option (get option-spec flag)]
+        (when-not option
+          (refuse! :unknown-option "unknown IPQ filesystem materialize option" {:option flag}))
+        (when-not (and value (not (.startsWith value "--")))
+          (refuse! :option-value "IPQ filesystem materialize option requires a value"
+                   {:option flag}))
+        (when (contains? options option)
+          (refuse! :duplicate-option "IPQ filesystem materialize option was repeated"
+                   {:option flag}))
+        (recur more (assoc options option value))))))
+
+(defn materialize! [{:keys [car root scope-root cache-root]}]
+  (when cache-root
+    (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) cache-root))
+  (let [mount (fs/mount {:car-bytes (.readFileSync node-fs car)
+                         :root root
+                         :scope-root scope-root
+                         :adl-capability (snapshot-adl-capability)})
+        files (count (filter (fn [[_ entry]] (= "file" (get entry "type")))
+                             (:entries mount)))]
+    {:status :materialized
+     :ipq-profile (:ipq-profile mount)
+     :root (:root mount)
+     :scope-root (:scope-root mount)
+     :local-root (:local-root mount)
+     :entries (count (:entries mount))
+     :files files
+     :loaded (get-in mount [:receipt :loaded])}))
+
+(defn run! [argv]
+  (materialize! (parse-args argv)))
+
