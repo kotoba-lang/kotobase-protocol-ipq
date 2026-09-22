@@ -1,0 +1,136 @@
+(ns kotobase.protocols.ipq-fs-test
+  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [ipld.car.bytes :as bytes]
+            [ipld.car :as car]
+            [ipld.core :as ipld]
+            [ipld.dag-json :as dag-json]
+            [kotoba.lang.text :as str]
+            [kotobase.protocols.ipq :as ipq]
+            [kotobase.protocols.ipq.fs :as fs]
+            [multiformats.core :as mf]))
+
+(def snapshot
+  {"version" 1
+   "entries" [{"path" "/workspace" "type" "directory"}
+              {"path" "/workspace/docs" "type" "directory"}
+              {"path" "/workspace/docs/readme.txt" "type" "file"
+               "text" "alpha\nbeta\nalpha\n"}
+              {"path" "/workspace/root.txt" "type" "file" "text" "root 😀\n"}]})
+
+(defn snapshot-adl []
+  {:version 1
+   :validate-representation (fn [value]
+                              (try (do (bytes/bcount value) true)
+                                   (catch #?(:clj Exception :cljs :default) _ false)))
+   :decode ipld/decode
+   :encode ipld/encode
+   :validate-logical map?
+   :fuel-costs {:validate-representation 1 :decode 1 :encode 1 :validate-logical 1}})
+
+(defn base64url [b]
+  (-> (dag-json/base64-encode b)
+      (str/replace "+" "-")
+      (str/replace "/" "_")
+      (str/replace "=" "")))
+
+(defn fixture []
+  (let [representation (ipld/encode snapshot)
+        root (mf/cidv1-raw representation)
+        ctx {:blocks {:get (fn [cid]
+                             (when (= cid root)
+                               {:bytes representation
+                                :content-type "application/vnd.ipld.raw"}))}}
+        response (ipq/handle ctx
+                             {:method :get
+                              :path (str "/ipq/v1/selection/" root)
+                              :headers {}
+                              :query {"selector" (base64url fs/snapshot-selector-bytes)}})
+        car-bytes (bytes/as-bytes (dag-json/base64-decode (:body response)))]
+    {:root root :response response :car-bytes car-bytes}))
+
+(defn mounted []
+  (let [{:keys [root car-bytes]} (fixture)]
+    (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+               :adl-capability (snapshot-adl)})))
+
+(defn problem [f]
+  (try (do (f) nil)
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) e
+         (or (:problem (ex-data e)) (:type (ex-data e))))))
+
+(deftest ipq-car-adl-and-filesystem-capabilities-form-one-verified-path
+  (let [{:keys [response]} (fixture)
+        mount (mounted)
+        providers (fs/provider-registry mount)]
+    (is (= 200 (:status response)) "the fixture really crossed the IPQ handler")
+    (is (= :kotobase.ipq/fs-mount-v1 (:format mount)))
+    (is (= 1 (:ipq-profile mount)))
+    (is (= [(:root mount)] (get-in mount [:receipt :loaded])))
+    (is (true? (get-in mount [:receipt :adl-determinism-checked?])))
+    (is (= #{34 35} (set (keys providers))))
+    (is (= "docs\t1\nroot.txt\t0" (fs/browse mount "/workspace")))
+    (is (= "readme.txt\t0" (fs/browse mount "/workspace/docs")))
+    (is (= "alpha\nbeta\nalpha\n"
+           (fs/app-data mount "/workspace/docs/readme.txt")))
+    (is (= "1" (fs/app-data mount "/workspace/docs/readme.txtEXISTS_SEP")))
+    (is (= "0" (fs/app-data mount "/workspace/missingEXISTS_SEP")))
+    (is (= "0 10 0 0" (fs/app-data mount "/workspace/root.txtSTAT_SEP")))
+    (is (= "0 0 0 1" (fs/app-data mount "/workspace/docsSTAT_SEP")))
+    (is (= "readme.txt\t0"
+           ((get-in providers [34 :invoke]) "/workspace/docs")))
+    (is (= "alpha\nbeta\nalpha\n"
+           ((get-in providers [35 :invoke]) "/workspace/docs/readme.txt")))))
+
+(deftest mount-and-provider-refuse-distinct-invalid-states
+  (let [{:keys [root car-bytes]} (fixture)]
+    (testing "ADL version mismatch is not accepted as a snapshot"
+      (is (= :adl-version-mismatch
+             (problem #(fs/mount {:car-bytes car-bytes :root root
+                                  :scope-root "/workspace"
+                                  :adl-capability (assoc (snapshot-adl) :version 2)})))))
+    (let [mount (mounted)]
+      (is (= :request-outside-scope (problem #(fs/browse mount "/etc"))))
+      (is (= :not-directory (problem #(fs/browse mount "/workspace/root.txt"))))
+      (is (= :is-directory (problem #(fs/app-data mount "/workspace/docs"))))
+      (is (= :not-found (problem #(fs/app-data mount "/workspace/missing"))))
+      (is (= :read-only-profile
+             (problem #(fs/app-data mount "/workspace/root.txtRANGE_SEP0:4")))))))
+
+(deftest a-car-with-bytes-that-do-not-match-the-requested-root-never-reaches-adl
+  (let [{:keys [root]} (fixture)
+        invoked (atom 0)
+        wrong (ipld/encode (assoc snapshot "version" 99))
+        tampered (:bytes (car/encode {:roots [root]
+                                      :blocks [{:cid root :bytes wrong}]}))
+        adl (assoc (snapshot-adl) :decode
+                   (fn [value] (swap! invoked inc) (ipld/decode value)))]
+    (is (= :ipld/cid-mismatch
+           (problem #(fs/mount {:car-bytes tampered :root root
+                                :scope-root "/workspace" :adl-capability adl}))))
+    (is (= 0 @invoked) "CID verification happens before ADL execution")))
+
+(deftest malformed-logical-snapshots-fail-closed
+  (letfn [(attempt [logical]
+            (let [representation (ipld/encode logical)
+                  root (mf/cidv1-raw representation)
+                  ctx {:blocks {:get (fn [cid] (when (= cid root) {:bytes representation}))}}
+                  response (ipq/handle ctx {:method :get
+                                            :path (str "/ipq/v1/selection/" root)
+                                            :headers {}
+                                            :query {"selector" (base64url fs/snapshot-selector-bytes)}})
+                  car-bytes (bytes/as-bytes (dag-json/base64-decode (:body response)))]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl)})))]
+    (is (= :duplicate-path
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/root.txt"
+                                       "type" "file" "text" "other"})))))
+    (is (= :noncanonical-path
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/../secret"
+                                       "type" "file" "text" "no"})))))
+    (is (= :parent-directory-required
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/missing/child"
+                                       "type" "file" "text" "no"})))))))

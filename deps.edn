@@ -30,8 +30,12 @@
         ;; raising `:ipld/unsupported-codec` -- which this handler had, until
         ;; the day before, re-thrown as a Cloudflare 500. Below this SHA the
         ;; refusal is named correctly and the traversal still stops there.
+        ;; 1b210253 additionally carries versioned ADL enforcement on the
+        ;; representation->logical and logical->representation paths. The IPQ
+        ;; filesystem adapter names KotobaFsSnapshot v1; below this SHA a v2
+        ;; capability under the same name is silently accepted as v1.
         io.github.kotoba-lang/io-ipld
-        {:git/sha "9bf07ce7894d1162842099f3f1e0ced252b82de9"}
+        {:git/sha "1b21025327e63652e533b54303b5e7b8e11f59ba"}
         ;; Floor, not a preference: `ipld.car.trustless/replay-selection` and
         ;; the bounded CARv2 index reads landed on 2026-09-06 and this surface
         ;; is meaningless without the first of them — a CAR nobody can replay

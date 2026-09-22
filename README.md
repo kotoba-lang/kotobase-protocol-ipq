@@ -28,6 +28,51 @@ The handler is a **pure cljc function** over an injected block port —
 Authentication and transport belong to the deploy shell, exactly as in
 [`kotobase-protocol-ipfs`](https://github.com/kotoba-lang/kotobase-protocol-ipfs).
 
+## `find` and `grep` over an IPQ snapshot
+
+`kotobase.protocols.ipq.fs` is the client-side seam from a verified IPQ/1 CAR
+to the filesystem capabilities existing Kotoba commands already call. It does
+not put HTTP or IPLD traversal inside `find` or `grep`:
+
+```
+IPQ/1 CAR → replay selector and verify CIDs
+          → versioned KotobaFsSnapshot ADL
+          → validated immutable path table
+          → wire 34 fs/browse + wire 35 fs/app-data providers
+          → unchanged find / grep guest
+```
+
+```clojure
+(require '[kotobase.protocols.ipq.fs :as ipq-fs])
+
+(def mount
+  (ipq-fs/mount {:car-bytes car-from-ipq
+                 :root expected-root
+                 :scope-root "/workspace"
+                 ;; In production this can be an
+                 ;; ipld.schema/wasm-adl-capability.
+                 :adl-capability snapshot-adl}))
+
+(ipq-fs/browse mount "/workspace")
+;; => "docs\t1\nREADME.md\t0"
+
+(ipq-fs/app-data mount "/workspace/README.md")
+;; => "..."
+
+(ipq-fs/provider-registry mount)
+;; => {34 {:request-type :string :result-type :string :invoke ...}
+;;     35 {:request-type :string :result-type :string :invoke ...}}
+```
+
+The mount accepts exactly one root match and rejects unused CAR blocks. The ADL
+must declare version 1 and is executed with explicit fuel, output-node, output-
+byte, depth, and determinism limits. Its logical result is then checked again:
+paths are canonical and scope-confined, parents must exist as directories,
+duplicates and unknown fields are refused, and total entries/content are
+bounded. The provider is read-only and currently implements the operations
+needed by `find` and `grep`: browse, full text read, `EXISTS`, and `STAT`.
+`RANGE` and `WRITE` are named refusals, not accidental pathname reads.
+
 ## What a 200 from here means, exactly
 
 The body is a CARv1 holding the blocks a bounded IPLD selector touched, root
