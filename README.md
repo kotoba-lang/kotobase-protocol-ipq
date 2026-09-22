@@ -90,6 +90,16 @@ default process cache is bounded to 16 immutable mounts; an explicit cache can
 isolate a shorter host/trust lifetime. Call `mount` directly when every newly
 supplied CAR must itself be audited for unused blocks.
 
+On the SCI/Node command runtime, a verified snapshot is atomically materialized
+under `${KOTOBA_IPQ_FS_CACHE:-~/.cache/kotoba/ipq-fs/v1}/<root-cid>/tree`.
+Files are `0444`, directories are `0555`, and `receipt.json` pins every relative
+path, byte count, and SHA-256 digest. The returned mount drops file text from
+both path and children indexes; wire 35 reads the materialized regular file and
+checks its digest. Existing roots are fully revalidated before reuse, staging
+directories are never published, symlinks are refused, and the oldest root is
+evicted after the bounded 16-root cache is exceeded. JVM use retains the pure
+in-memory mount until the same disk adapter is supplied for that host.
+
 ## What a 200 from here means, exactly
 
 The body is a CARv1 holding the blocks a bounded IPLD selector touched, root

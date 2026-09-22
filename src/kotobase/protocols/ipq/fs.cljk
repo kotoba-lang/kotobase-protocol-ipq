@@ -17,7 +17,8 @@
             [ipld.car.trustless :as trustless]
             [ipld.schema :as schema]
             [ipld.selector :as selector]
-            [kotobase.protocols.ipq :as ipq]))
+            [kotobase.protocols.ipq :as ipq]
+            #?@(:cljs [[kotobase.protocols.ipq.fs-disk :as disk]])))
 
 (def ^:const browse-provider-id 34)
 (def ^:const app-data-provider-id 35)
@@ -208,9 +209,13 @@
 (defn- strip-suffix [value suffix]
   (subs value 0 (- (count value) (count suffix))))
 
-(defn- stat-response [entry]
+(defn- stat-response [mount entry]
   (str "0 " (if (= "file" (get entry "type"))
-               (utf8-byte-count (get entry "text")) 0)
+               #?(:cljs (if (:local-root mount)
+                          (disk/stat-size mount (get entry "path"))
+                          (utf8-byte-count (get entry "text")))
+                  :clj (utf8-byte-count (get entry "text")))
+               0)
        " 0 " (if (= "directory" (get entry "type")) "1" "0")))
 
 (defn app-data
@@ -235,13 +240,16 @@
       (case operation
         :exists (if entry "1" "0")
         :stat (if entry
-                (stat-response entry)
+                (stat-response mount entry)
                 (fail! :not-found "fs/app-data STAT target does not exist" {:path path}))
         :read (cond
                 (nil? entry) (fail! :not-found "fs/app-data target does not exist" {:path path})
                 (= "directory" (get entry "type"))
                 (fail! :is-directory "fs/app-data cannot read a directory" {:path path})
-                :else (get entry "text"))))))
+                :else #?(:cljs (if (:local-root mount)
+                                 (disk/read-text mount path)
+                                 (get entry "text"))
+                         :clj (get entry "text")))))))
 
 (declare mount default-mount)
 
@@ -300,7 +308,9 @@
   (assert-cache! cache)
   (assert-mount-identity-options! options)
   (when-let [cached (get-in @(:state cache) [:mounts (cache-key options)])]
-    (assoc-in cached [:receipt :cache] :hit)))
+    (assoc-in #?(:cljs (if (:local-root cached) (disk/validate-mount! cached) cached)
+                 :clj cached)
+              [:receipt :cache] :hit)))
 
 (defn mount-cached
   "Return a verified mount from an explicit bounded cache, or verify and cache it.
@@ -355,22 +365,25 @@
                    (assoc (:adl limits) :adl-capabilities {adl-name adl-capability}))
           {:keys [by-path children-by-parent]}
           (validate-snapshot! scope-root (:logical-value decoded))]
-      {:format :kotobase.ipq/fs-mount-v1
-       :ipq-profile ipq/profile
-       :root root
-       :scope-root scope-root
-       :entries by-path
-       :children-by-parent
-       (into {} (map (fn [[parent children]]
-                       [parent (vec (sort-by (fn [entry] (get entry "path")) children))]))
-             children-by-parent)
-       :receipt {:loaded (mapv :cid (:loaded replayed))
-                 :selector-bytes selector-bytes
-                 :adl-name adl-name
-                 :adl-version snapshot-version
-                 :adl-fuel-used (:adl-fuel-used decoded)
-                 :adl-determinism-checked? (:adl-determinism-checked? decoded)
-                 :adl-receipts (:adl-receipts decoded)}})))
+      (let [verified
+            {:format :kotobase.ipq/fs-mount-v1
+             :ipq-profile ipq/profile
+             :root root
+             :scope-root scope-root
+             :entries by-path
+             :children-by-parent
+             (into {} (map (fn [[parent children]]
+                             [parent (vec (sort-by (fn [entry] (get entry "path")) children))]))
+                   children-by-parent)
+             :receipt {:loaded (mapv :cid (:loaded replayed))
+                       :selector-bytes selector-bytes
+                       :adl-name adl-name
+                       :adl-version snapshot-version
+                       :adl-fuel-used (:adl-fuel-used decoded)
+                       :adl-determinism-checked? (:adl-determinism-checked? decoded)
+                       :adl-receipts (:adl-receipts decoded)}}]
+        #?(:cljs (disk/materialize verified)
+           :clj verified)))))
 
 (defonce ^:private default-mount-cache
   (create-mount-cache default-cache-capacity))
