@@ -45,13 +45,17 @@ IPQ/1 CAR → replay selector and verify CIDs
 ```clojure
 (require '[kotobase.protocols.ipq.fs :as ipq-fs])
 
+(def identity
+  {:root expected-root
+   :scope-root "/workspace"
+   ;; In production this can be an ipld.schema/wasm-adl-capability.
+   :adl-capability snapshot-adl})
+
+;; Default host path: the bounded verified cache is checked before network I/O.
+(def providers
+  (ipq-fs/provider-registry identity #(fetch-ipq-car expected-root)))
 (def mount
-  (ipq-fs/mount {:car-bytes car-from-ipq
-                 :root expected-root
-                 :scope-root "/workspace"
-                 ;; In production this can be an
-                 ;; ipld.schema/wasm-adl-capability.
-                 :adl-capability snapshot-adl}))
+  (ipq-fs/default-mount identity #(fetch-ipq-car expected-root)))
 
 (ipq-fs/browse mount "/workspace")
 ;; => "docs\t1\nREADME.md\t0"
@@ -63,12 +67,9 @@ IPQ/1 CAR → replay selector and verify CIDs
 ;; => {34 {:request-type :string :result-type :string :invoke ...}
 ;;     35 {:request-type :string :result-type :string :invoke ...}}
 
-;; A long-lived host can reuse verification by explicit CID-scoped cache.
-;; Reuse the same capability value: capability identity is part of the key.
+;; A host needing an isolated lifetime/trust boundary can instead use an
+;; explicit CID-scoped cache. Reuse the same capability value.
 (def cache (ipq-fs/create-mount-cache 16))
-(def identity {:root expected-root
-               :scope-root "/workspace"
-               :adl-capability snapshot-adl})
 (or (ipq-fs/lookup-mount cache identity) ; before network access
     (ipq-fs/mount-cached cache
                          (assoc identity :car-bytes (fetch-ipq-car expected-root))))
@@ -85,8 +86,9 @@ needed by `find` and `grep`: browse, full text read, `EXISTS`, and `STAT`.
 `RANGE` and `WRITE` are named refusals, not accidental pathname reads.
 Directory children are sorted and indexed once at mount time, so recursive
 browse is linear in the visited tree rather than entries × directories. The
-cache is bounded and explicit rather than process-global; call `mount` directly
-when every newly supplied CAR must itself be audited for unused blocks.
+default process cache is bounded to 16 immutable mounts; an explicit cache can
+isolate a shorter host/trust lifetime. Call `mount` directly when every newly
+supplied CAR must itself be audited for unused blocks.
 
 ## What a 200 from here means, exactly
 

@@ -178,3 +178,17 @@
         "the documented 4096-entry ceiling is admitted")
     (is (= :entry-limit (problem #(attempt 4096)))
         "the next entry is refused by the named logical limit")))
+
+(deftest provider-registry-defaults-to-fetch-before-cache-only-once
+  (let [{:keys [root car-bytes]} (fixture)
+        fetches (atom 0)
+        identity {:root root :scope-root "/workspace"
+                  :adl-capability (snapshot-adl)}
+        fetch-car (fn [] (swap! fetches inc) car-bytes)
+        first-registry (fs/provider-registry identity fetch-car)
+        second-registry (fs/provider-registry identity fetch-car)]
+    (is (= 1 @fetches) "all filesystem commands share one verified default mount")
+    (is (= "docs\t1\nroot.txt\t0"
+           ((get-in first-registry [34 :invoke]) "/workspace")))
+    (is (= "alpha\nbeta\nalpha\n"
+           ((get-in second-registry [35 :invoke]) "/workspace/docs/readme.txt")))))
