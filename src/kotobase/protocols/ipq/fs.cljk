@@ -1,0 +1,269 @@
+(ns kotobase.protocols.ipq.fs
+  "Read-only filesystem providers backed by one verified IPQ/1 selection.
+
+  The transport and representation boundaries stay separate:
+
+  * IPQ replays a selector against the returned CAR and verifies every CID.
+  * the named, versioned ADL turns the selected raw representation into a
+    logical filesystem snapshot;
+  * this namespace validates that logical value and exposes the existing
+    `:fs/browse` (wire 34) and `:fs/app-data` (wire 35) string contracts.
+
+  `find`, `grep`, and the other Kotoba commands therefore keep their existing
+  capability calls.  The host chooses this provider instead of a local-filesystem
+  provider; the guest never receives ambient network or block-store authority."
+  (:require [kotoba.lang.text :as str]
+            [ipld.car.bytes :as bytes]
+            [ipld.car.trustless :as trustless]
+            [ipld.schema :as schema]
+            [ipld.selector :as selector]
+            [kotobase.protocols.ipq :as ipq]))
+
+(def ^:const browse-provider-id 34)
+(def ^:const app-data-provider-id 35)
+(def ^:const adl-name "KotobaFsSnapshot")
+(def ^:const snapshot-version 1)
+
+(def limits
+  "The logical expansion budget after IPQ's own four traversal budgets.
+
+  The content ceiling equals IPQ/1's published byte ceiling.  ADL expansion is
+  separately bounded because a small representation can decode to a large
+  logical value."
+  {:max-entries 4096
+   :max-content-bytes 4194304
+   :adl {:max-depth 32
+         :max-nodes 16384
+         :max-adl-fuel 1000000
+         :max-adl-output-nodes 16384
+         :max-adl-output-bytes 4194304
+         :check-adl-determinism? true}})
+
+(def snapshot-selector-bytes
+  "Canonical selector for an IPQ filesystem snapshot: match the raw root."
+  (selector/encode {:selector :matcher}))
+
+(def ^:private compiled-snapshot-schema
+  (schema/compile-schema
+   {"types" {"Snapshot"
+             {"bytes" {"representation" {"advanced" adl-name}}}}
+    "advanced" {adl-name {"version" snapshot-version}}}))
+
+(defn- fail! [problem message data]
+  (throw (ex-info message (assoc data
+                                 :phase :ipq-fs
+                                 :problem problem))))
+
+(defn- utf8-byte-count [text]
+  #?(:clj (alength (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8))
+     :cljs (.-length (.encode (js/TextEncoder.) text))))
+
+(defn- forbidden-path-text? [path]
+  (or (str/includes? path "\n")
+      (str/includes? path "\t")
+      (str/includes? path "EXISTS_SEP")
+      (str/includes? path "STAT_SEP")
+      (str/includes? path "RANGE_SEP")
+      (str/includes? path "WRITE_SEP")))
+
+(defn- canonical-path? [path]
+  (and (string? path)
+       (str/starts-with? path "/")
+       (or (= path "/") (not (str/ends-with? path "/")))
+       (not (forbidden-path-text? path))
+       (every? #(and (not= % "") (not= % ".") (not= % ".."))
+               (rest (str/split path #"/" -1)))))
+
+(defn- within-scope? [scope-root path]
+  (or (= path scope-root)
+      (and (not= scope-root "/")
+           (str/starts-with? path (str scope-root "/")))
+      (and (= scope-root "/") (str/starts-with? path "/"))))
+
+(defn- parent-path [path]
+  (when-not (= path "/")
+    (let [parts (str/split path #"/")]
+      (if (= 2 (count parts))
+        "/"
+        (apply str (interpose "/" (butlast parts)))))))
+
+(defn- base-name [path]
+  (last (str/split path #"/")))
+
+(defn- exact-entry? [entry kind]
+  (= (set (keys entry))
+     (if (= kind "directory") #{"path" "type"} #{"path" "type" "text"})))
+
+(defn- validate-entry! [scope-root entry]
+  (when-not (map? entry)
+    (fail! :entry-not-map "IPQ filesystem entry must be a map" {:entry entry}))
+  (let [path (get entry "path")
+        kind (get entry "type")]
+    (when-not (contains? #{"directory" "file"} kind)
+      (fail! :unknown-entry-type "IPQ filesystem entry type is not supported"
+             {:path path :type kind}))
+    (when-not (exact-entry? entry kind)
+      (fail! :entry-fields "IPQ filesystem entry fields are not exact"
+             {:path path :type kind :keys (set (keys entry))}))
+    (when-not (canonical-path? path)
+      (fail! :noncanonical-path "IPQ filesystem path is not canonical" {:path path}))
+    (when-not (within-scope? scope-root path)
+      (fail! :path-outside-scope "IPQ filesystem path is outside its mount scope"
+             {:scope-root scope-root :path path}))
+    (when (and (= kind "file") (not (string? (get entry "text"))))
+      (fail! :file-text-required "IPQ filesystem file content must be text"
+             {:path path}))
+    entry))
+
+(defn- validate-snapshot! [scope-root value]
+  (when-not (and (map? value) (= #{"version" "entries"} (set (keys value))))
+    (fail! :snapshot-fields "IPQ filesystem snapshot fields are not exact"
+           {:keys (when (map? value) (set (keys value)))}))
+  (when-not (= snapshot-version (get value "version"))
+    (fail! :snapshot-version "IPQ filesystem snapshot version is not supported"
+           {:expected snapshot-version :actual (get value "version")}))
+  (let [entries (get value "entries")]
+    (when-not (vector? entries)
+      (fail! :entries-not-vector "IPQ filesystem entries must be a vector" {}))
+    (when (> (count entries) (:max-entries limits))
+      (fail! :entry-limit "IPQ filesystem snapshot exceeds the entry limit"
+             {:maximum (:max-entries limits) :actual (count entries)}))
+    (let [entries (mapv #(validate-entry! scope-root %) entries)
+          by-path (into {} (map (juxt #(get % "path") identity)) entries)]
+      (when-not (= (count entries) (count by-path))
+        (fail! :duplicate-path "IPQ filesystem snapshot contains duplicate paths" {}))
+      (when-not (= "directory" (get-in by-path [scope-root "type"]))
+        (fail! :scope-root-required "IPQ filesystem scope root must be a directory"
+               {:scope-root scope-root}))
+      (doseq [entry entries
+              :let [path (get entry "path") parent (parent-path path)]
+              :when (not= path scope-root)]
+        (when-not (= "directory" (get-in by-path [parent "type"]))
+          (fail! :parent-directory-required
+                 "IPQ filesystem entry parent must exist and be a directory"
+                 {:path path :parent parent})))
+      (let [content-bytes (reduce + 0 (map #(if (= "file" (get % "type"))
+                                                (utf8-byte-count (get % "text")) 0)
+                                           entries))]
+        (when (> content-bytes (:max-content-bytes limits))
+          (fail! :content-limit "IPQ filesystem snapshot exceeds the content limit"
+                 {:maximum (:max-content-bytes limits) :actual content-bytes})))
+      by-path)))
+
+(defn- assert-request-path! [mount path]
+  (when-not (canonical-path? path)
+    (fail! :noncanonical-request-path "filesystem request path is not canonical"
+           {:path path}))
+  (when-not (within-scope? (:scope-root mount) path)
+    (fail! :request-outside-scope "filesystem request is outside the IPQ mount"
+           {:scope-root (:scope-root mount) :path path}))
+  path)
+
+(defn browse
+  "Wire-34 response for one directory in a mounted IPQ snapshot."
+  [mount path]
+  (assert-request-path! mount path)
+  (when-not (= "directory" (get-in mount [:entries path "type"]))
+    (fail! :not-directory "fs/browse target is not a directory" {:path path}))
+  (->> (vals (:entries mount))
+       (filter #(= path (parent-path (get % "path"))))
+       (sort-by #(get % "path"))
+       (map (fn [entry]
+              (str (base-name (get entry "path")) "\t"
+                   (if (= "directory" (get entry "type")) "1" "0"))))
+       (str/join "\n")))
+
+(defn- strip-suffix [value suffix]
+  (subs value 0 (- (count value) (count suffix))))
+
+(defn- stat-response [entry]
+  (str "0 " (if (= "file" (get entry "type"))
+               (utf8-byte-count (get entry "text")) 0)
+       " 0 " (if (= "directory" (get entry "type")) "1" "0")))
+
+(defn app-data
+  "Wire-35 read/EXISTS/STAT response for a mounted IPQ snapshot.
+
+  The provider is intentionally read-only. RANGE and WRITE are refused by name
+  instead of being silently treated as path text; find and grep need full read,
+  EXISTS, and STAT only."
+  [mount request]
+  (let [[operation path]
+        (cond
+          (str/ends-with? request "EXISTS_SEP") [:exists (strip-suffix request "EXISTS_SEP")]
+          (str/ends-with? request "STAT_SEP") [:stat (strip-suffix request "STAT_SEP")]
+          (str/includes? request "RANGE_SEP") [:range request]
+          (str/includes? request "WRITE_SEP") [:write request]
+          :else [:read request])]
+    (when (contains? #{:range :write} operation)
+      (fail! :read-only-profile "IPQ filesystem provider does not admit this operation"
+             {:operation operation}))
+    (assert-request-path! mount path)
+    (let [entry (get (:entries mount) path)]
+      (case operation
+        :exists (if entry "1" "0")
+        :stat (if entry
+                (stat-response entry)
+                (fail! :not-found "fs/app-data STAT target does not exist" {:path path}))
+        :read (cond
+                (nil? entry) (fail! :not-found "fs/app-data target does not exist" {:path path})
+                (= "directory" (get entry "type"))
+                (fail! :is-directory "fs/app-data cannot read a directory" {:path path})
+                :else (get entry "text"))))))
+
+(defn provider-registry
+  "Exact provider descriptors accepted by Kotoba's reference runtime.
+
+  The numeric keys are the stable wire ids current find/grep artifacts carry."
+  [mount]
+  {browse-provider-id {:request-type :string :result-type :string
+                       :invoke #(browse mount %)}
+   app-data-provider-id {:request-type :string :result-type :string
+                         :invoke #(app-data mount %)}})
+
+(defn mount
+  "Verify an IPQ/1 CAR, decode its one raw match through the versioned ADL, and
+  return an immutable read-only filesystem mount.
+
+  Required options are `:car-bytes`, `:root`, and `:adl-capability`. Optional
+  `:selector-bytes` defaults to the root matcher and `:scope-root` defaults to
+  `/`. The ADL capability must declare version 1; production callers can pass
+  `ipld.schema/wasm-adl-capability`, while tests may use a pure capability."
+  [{:keys [car-bytes root selector-bytes scope-root adl-capability]
+    :or {selector-bytes snapshot-selector-bytes scope-root "/"}
+    :as options}]
+  (when-not (= (set (keys options))
+               (set (filter #(contains? options %)
+                            [:car-bytes :root :selector-bytes :scope-root :adl-capability])))
+    (fail! :unknown-option "IPQ filesystem mount options are not exact"
+           {:keys (set (keys options))}))
+  (when-not (and car-bytes (string? root) (map? adl-capability))
+    (fail! :mount-input "IPQ filesystem mount requires CAR bytes, root, and ADL capability" {}))
+  (when-not (canonical-path? scope-root)
+    (fail! :scope-root "IPQ filesystem scope root is not canonical"
+           {:scope-root scope-root}))
+  (let [replayed (trustless/replay-selection (bytes/as-bytes car-bytes)
+                                             root selector-bytes ipq/limits)
+        matches (:matches replayed)]
+    (when-not (empty? (:unused replayed))
+      (fail! :unused-blocks "IPQ filesystem CAR contains blocks outside its proof"
+             {:unused (:unused replayed)}))
+    (when-not (and (= 1 (count matches)) (= [] (:path (first matches))))
+      (fail! :snapshot-match "IPQ filesystem selector must match only the raw root"
+             {:matches (mapv :path matches)}))
+    (let [decoded (schema/representation->logical!
+                   compiled-snapshot-schema "Snapshot" (:value (first matches))
+                   (assoc (:adl limits) :adl-capabilities {adl-name adl-capability}))
+          entries (validate-snapshot! scope-root (:logical-value decoded))]
+      {:format :kotobase.ipq/fs-mount-v1
+       :ipq-profile ipq/profile
+       :root root
+       :scope-root scope-root
+       :entries entries
+       :receipt {:loaded (mapv :cid (:loaded replayed))
+                 :selector-bytes selector-bytes
+                 :adl-name adl-name
+                 :adl-version snapshot-version
+                 :adl-fuel-used (:adl-fuel-used decoded)
+                 :adl-determinism-checked? (:adl-determinism-checked? decoded)
+                 :adl-receipts (:adl-receipts decoded)}})))
