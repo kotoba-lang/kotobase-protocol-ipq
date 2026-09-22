@@ -243,17 +243,24 @@
                 (fail! :is-directory "fs/app-data cannot read a directory" {:path path})
                 :else (get entry "text"))))))
 
+(declare mount default-mount)
+
 (defn provider-registry
   "Exact provider descriptors accepted by Kotoba's reference runtime.
 
-  The numeric keys are the stable wire ids current find/grep artifacts carry."
-  [mount]
-  {browse-provider-id {:request-type :string :result-type :string
-                       :invoke #(browse mount %)}
-   app-data-provider-id {:request-type :string :result-type :string
-                         :invoke #(app-data mount %)}})
+  One argument accepts an already resolved mount. Two arguments are the default
+  host path: mount identity plus a zero-argument CAR fetch function, with the
+  process-bounded verified cache consulted before that function is called.
 
-(declare mount)
+  The numeric keys are the stable wire ids used by find, grep, cat, head, tail,
+  wc, sort, uniq, diff, awk, sed, stat, shasum, which, ls, du, and cp/rm reads."
+  ([mount]
+   {browse-provider-id {:request-type :string :result-type :string
+                        :invoke #(browse mount %)}
+    app-data-provider-id {:request-type :string :result-type :string
+                          :invoke #(app-data mount %)}})
+  ([identity-options fetch-car]
+   (provider-registry (default-mount identity-options fetch-car))))
 
 (defn create-mount-cache
   "Create a bounded cache for already verified immutable mounts.
@@ -364,3 +371,20 @@
                  :adl-fuel-used (:adl-fuel-used decoded)
                  :adl-determinism-checked? (:adl-determinism-checked? decoded)
                  :adl-receipts (:adl-receipts decoded)}})))
+
+(defonce ^:private default-mount-cache
+  (create-mount-cache default-cache-capacity))
+
+(defn default-mount
+  "Resolve a mount through the default bounded cache, fetching only on miss.
+
+  `identity-options` carries root and the optional selector/scope plus the exact
+  ADL capability. `fetch-car` is a zero-argument function so network authority
+  stays with the host and is never invoked on a cache hit."
+  [identity-options fetch-car]
+  (assert-mount-identity-options! identity-options)
+  (when-not (fn? fetch-car)
+    (fail! :fetch-car "default IPQ filesystem mount requires a CAR fetch function" {}))
+  (or (lookup-mount default-mount-cache identity-options)
+      (mount-cached default-mount-cache
+                    (assoc identity-options :car-bytes (fetch-car)))))
