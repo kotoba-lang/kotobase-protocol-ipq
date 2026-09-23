@@ -102,17 +102,26 @@
   `:max-referenced-bytes` bounds bytes a manifest ORDERS someone to fetch.
   Those never sit in one response: they arrive one block at a time and land in
   the disk cache, so what binds them is that cache rather than memory.
-  `fs-disk/max-cache-roots` keeps 16 materialized trees, so 64 MiB per tree
-  bounds the cache at 1 GiB. It is checkable from the manifest ALONE, before
-  the first fetch — which is the property worth having, because a budget you
-  can only discover by exhausting it has already cost you the thing it was
-  meant to protect.
+  `fs-disk/max-cache-roots` keeps 16 materialized trees, so this value times
+  sixteen is the worst case on disk: 2 GiB. It is checkable from the manifest
+  ALONE, before the first fetch — which is the property worth having, because
+  a budget you can only discover by exhausting it has already cost you the
+  thing it was meant to protect.
+
+  It was 64 MiB for half a day, chosen from the cache arithmetic alone and
+  before anything had measured the tree it exists to admit. That tree —
+  kotoba.cloud's `public/` with the content-addressed block stores pruned,
+  which is what a remote audit needs — is 85,115,326 bytes across 737 files
+  in 1,368 entries. The entry count fit with room to spare and the byte
+  budget refused it by 27%. A ceiling derived from one true constraint can
+  still be the wrong number if nobody checked it against the case it was
+  for.
 
   `:max-file-bytes` bounds ONE referenced file, because that block has to come
   back inside one IPQ selection. Derived, for the same reason as the first."
   {:max-entries max-entries
    :max-inline-content-bytes (:max-bytes ipq/limits)
-   :max-referenced-bytes 67108864
+   :max-referenced-bytes 134217728
    :max-file-bytes (:max-bytes ipq/limits)
    :adl {:max-depth 32
          :max-nodes 16384
