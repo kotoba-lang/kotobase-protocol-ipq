@@ -118,7 +118,15 @@
                   :when (= "directory" (get entry "type"))]
             (.chmodSync node-fs (local-path staging-tree (:scope-root verified-mount) path) 365))
           (.chmodSync node-fs staging-tree 365)
-          (.chmodSync node-fs staging 365)
+          ;; `staging` itself stays writable until AFTER the rename, and is
+          ;; sealed as `target`. Sealing it first cost the whole suite:
+          ;; renaming a 0555 directory is EACCES on macOS even when the
+          ;; parent is writable and the move does not change parents.
+          ;; Reproduced both directions before this line was written —
+          ;; mkdir + chmod 0555 + rename = EACCES, the same rename with the
+          ;; directory left 0755 = OK. The publish is still the rename, so
+          ;; this is not a weaker guarantee: the window in which `target` is
+          ;; writable is inside `base`, which is 0700.
           (try (.renameSync node-fs staging target)
                (catch :default e
                  (if (.existsSync node-fs target)
@@ -126,6 +134,7 @@
                        (.rmSync node-fs staging #js {:recursive true :force true})
                        (validate-existing! target root))
                    (throw e))))
+          (.chmodSync node-fs target 365)
           (catch :default e
             (when (.existsSync node-fs staging)
               (try (make-writable! staging) (catch :default _ nil))

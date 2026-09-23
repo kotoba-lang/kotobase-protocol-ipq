@@ -42,6 +42,49 @@ IPQ/1 CAR → replay selector and verify CIDs
           → unchanged find / grep guest
 ```
 
+### Two snapshot versions, and why there are two
+
+A **version 1** snapshot inlines every file as UTF-8 `text`. One block is the
+whole answer: when it arrives there is nothing further to fetch, and for a tree
+that fits in a block that is the better arrangement, not a lesser one.
+
+It is also bounded by `maxBytes`. That bounds the *answer*, but because the
+files are inside it, it bounded the *tree* as well — and a filesystem snapshot
+format that cannot describe a 40 MiB directory is not describing filesystems.
+
+A **version 2** entry may instead NAME its bytes:
+
+```clojure
+{"path" "/workspace/docs/readme.txt" "type" "file"
+ "cid" "bafkrei…" "size" 17}          ; raw CIDv1 over sha2-256
+```
+
+The snapshot becomes a manifest whose size grows with the number of files
+rather than their bytes. Identical files share a CID and are fetched once, an
+unchanged file stays in the disk cache across releases, and one edited document
+no longer invalidates its 599 neighbours.
+
+Naming content costs a block port, so `mount` takes one:
+
+```clojure
+(ipq-fs/mount {:car-bytes car :root root :scope-root "/workspace"
+               :adl-capability snapshot-adl
+               :blocks {:get (fn [cid] {:bytes (fetch-block cid)})}})
+```
+
+This namespace still holds no authority of its own — the host injects the port,
+the same shape `ipq/handle` takes. A manifest that names content without one is
+refused as `:blocks-port-required` rather than mounted into a tree whose files
+turn out to be unreadable a call later. Every block is then checked against the
+CID it was asked for, the size the manifest declared, and the text contract it
+will be served under, each with its own refusal.
+
+Both versions are read; version 2 is written. Budgets follow the same split —
+`:max-inline-content-bytes` is derived from IPQ's per-response ceiling because
+those bytes are already in hand, while `:max-referenced-bytes` bounds what a
+manifest *orders* and is answered from the manifest alone, before the first
+fetch.
+
 ```clojure
 (require '[kotobase.protocols.ipq.fs :as ipq-fs])
 

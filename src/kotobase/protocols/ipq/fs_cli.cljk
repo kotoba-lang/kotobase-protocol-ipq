@@ -14,7 +14,7 @@
 (def git-manifest-schema "kotoba.ipq.git-project.v1")
 
 (defn snapshot-adl-capability []
-  {:version fs/snapshot-version
+  {:version fs/adl-version
    :validate-representation (fn [value]
                               (try (do (bytes/bcount value) true)
                                    (catch :default _ false)))
