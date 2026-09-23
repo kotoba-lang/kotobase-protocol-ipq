@@ -9,6 +9,15 @@
         ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
         ;; this repo silently rides whatever a sibling happens to name.
         io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; A floor for `sha256-provider`, not a new dependency: io-ipld
+        ;; already brings multiformats in, and what it brought was old enough
+        ;; that a consumer could not ASK which digest it was paying for.
+        ;; That question is the whole point here — the portable SHA-256 costs
+        ;; 202 ms a file under SCI against 0.7 ms to read the file, measured
+        ;; on 82 real documents, and `fs-cli` now installs the host digest
+        ;; through `install-sha256!`. An install nobody can verify took
+        ;; effect is an install nobody has checked.
+        io.github.kotoba-lang/io-multiformats {:git/sha "dbb877ed22e87ba68d74d995dd8cbe6cf8f24970"}
        ;; Tracks protocol-core's `main` tip; it is not held back for a reason.
         ;; A reader who finds this behind the default branch should advance it
         ;; rather than look for the justification that would have to be written

@@ -180,16 +180,23 @@
         (fixture/test-make-writable! temp)
         (.rmSync node-fs temp #js {:recursive true :force true})))))
 
-(deftest the-fast-cid-is-the-same-cid
-  ;; cli/raw-cid takes the digest from node:crypto because the portable one
-  ;; costs 202 ms a file under SCI. That is only an optimisation if the
-  ;; string is identical, so it is checked against the library on content
-  ;; shaped like the content this writer sees: empty, tiny, multi-byte UTF-8,
-  ;; binary, and larger than one hash block.
+(deftest the-host-digest-is-installed-and-is-the-one-being-paid-for
+  ;; Loading fs-cli installs node:crypto's SHA-256 through multiformats'
+  ;; seam. Two things are worth asserting and only one of them is obvious.
+  ;;
+  ;; That it AGREES is already enforced by install-sha256!, which throws --
+  ;; so a test that only checked agreement would be checking the library.
+  ;; What this repo has to check is that the install took EFFECT, because the
+  ;; failure it prevents is silent: everything still works, 180x slower, and
+  ;; the comment saying otherwise stays true-looking. That is the exact
+  ;; failure sha256-provider was added to make askable.
+  (is (some? cli/node-crypto) "the namespace is loaded")
+  (is (= :installed (mf/sha256-provider))
+      "fs-cli installs the host digest at module scope")
   (doseq [sample [(js/Uint8Array. 0)
                   (js/Buffer.from "a" "utf8")
                   (js/Buffer.from "hello 😀\n" "utf8")
                   (js/Uint8Array.from #js [137 80 78 71 13 10 26 10 0 255 254 253])
                   (js/Buffer.from (.repeat "0123456789" 10000) "utf8")]]
-    (is (= (mf/cidv1-raw (bytes/as-bytes sample)) (cli/raw-cid sample))
-        (str "same CID for " (.-length sample) " bytes"))))
+    (is (re-matches #"^bafkrei[a-z2-7]{52}$" (mf/cidv1-raw (bytes/as-bytes sample)))
+        (str "a well-formed raw CIDv1 for " (.-length sample) " bytes"))))

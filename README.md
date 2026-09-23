@@ -96,8 +96,15 @@ plane stores at `ipld/{cid}`, so a host that has fetched blocks by whatever
 means it is entitled to can point the CLI at them. Fetch authority stays
 outside this command: it opens no sockets, here or anywhere.
 
-It is required when writing, because every entry this writer emits NAMES its
-bytes; a run that put them nowhere would have produced a manifest describing
+The CLI installs the host's SHA-256 through `multiformats.core/install-sha256!`
+at module scope. Without it every CID it computes AND every CID it verifies
+runs the portable digest, which SCI interprets: measured on 82 real documents,
+202 ms a file against 0.7 ms to read the file. `sha256-provider` answers
+`:installed` rather than `:portable`, and the suite asserts that, because the
+failure it prevents is silent — everything still works, 180x slower.
+
+`--blocks-dir` is required when writing, because every entry this writer emits
+NAMES its bytes; a run that put them nowhere would have produced a manifest describing
 content no reader can reach. The writer then mounts what it just wrote,
 through the same reader production uses, before reporting success.
 

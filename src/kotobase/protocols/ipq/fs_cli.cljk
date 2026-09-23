@@ -180,26 +180,35 @@
             (when (.existsSync node-fs file)
               {:bytes (.readFileSync node-fs file)})))})
 
-(defn raw-cid
-  "The raw CIDv1 of these bytes, with the DIGEST taken by the runtime.
-
-  `multiformats.core/cidv1-raw` does this in one call, and its sha2-256 is
-  portable ClojureScript that the SCI runtime interprets. Measured 2026-09-23
-  on 82 real documents (3.08 MB): reading them cost 60 ms in total and
-  hashing them cost 16,595 ms — 202 ms per file, 276 times the I/O. A writer
-  for a site-sized tree cannot pay that.
-
-  Only the digest moves. The CID is still ASSEMBLED by multiformats, from
-  the multihash prefix it defines, so this cannot drift into a second way of
-  naming the same bytes — `the-fast-cid-is-the-same-cid` asserts the two
-  agree on real content."
-  [buf]
-  (let [digest (-> (.createHash node-crypto "sha256") (.update buf) (.digest))
-        multihash (js/Uint8Array. (+ 2 (.-length digest)))]
-    (aset multihash 0 0x12)
-    (aset multihash 1 0x20)
-    (.set multihash digest 2)
-    (mf/cidv1 mf/codec-raw multihash)))
+;; ── the digest ───────────────────────────────────────────────────────────────
+;;
+;; multiformats ships a portable SHA-256 and a seam to replace it, and asks
+;; callers not to assume which one is running. Measured 2026-09-23 on 82 real
+;; documents (3.08 MB) with nothing installed: reading them cost 60 ms and
+;; hashing them cost 16,595 ms — 202 ms a file, 276x the I/O. Every CID this
+;; command computes or VERIFIES pays it, so `materialize` of those same 82
+;; files took 9.2 s.
+;;
+;; The first version of this fix hashed with node:crypto in a local function
+;; and left the library's own `cidv1-raw` alone. That made the WRITER fast
+;; and the reader slow, because `fs/resolve-content!` — the half that checks
+;; what a port returned — calls the library. Installing through the seam
+;; fixes both, and is what the seam is for: kotobase-ipfs and the control
+;; plane already install @noble/hashes the same way.
+;;
+;; `install-sha256!` proves the candidate against the portable implementation
+;; over a block-boundary corpus and THROWS on disagreement, so at module
+;; scope a wrong digest fails the command rather than producing CIDs from it
+;; — the right way round for a value that is an identity.
+;;
+;; node:crypto rather than a package: this namespace is already Node-only and
+;; the runtime's digest needs no dependency to be added.
+(defonce ^:private installed-sha256
+  (mf/install-sha256!
+   (fn [b]
+     (-> (.createHash node-crypto "sha256")
+         (.update (if (instance? js/Uint8Array b) b (js/Uint8Array.from (into-array b))))
+         (.digest)))))
 
 (defn- refuse-unusable-name! [name]
   (when (or (str/includes? name "/") (str/includes? name "\n")
@@ -249,7 +258,7 @@
 
                     (.isFile stat)
                     (let [buf (.readFileSync node-fs child)
-                          cid (raw-cid buf)]
+                          cid (mf/cidv1-raw (bytes/as-bytes buf))]
                       (when blocks-dir
                         (.writeFileSync node-fs (.join node-path blocks-dir cid) buf))
                       (swap! bytes-total + (.-byteLength buf))
