@@ -1,5 +1,5 @@
 (ns kotobase.protocols.ipq-fs-test
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing use-fixtures]])
             [ipld.car.bytes :as bytes]
             [ipld.car :as car]
