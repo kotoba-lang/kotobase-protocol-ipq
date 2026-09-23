@@ -256,3 +256,158 @@
          (.writeFileSync node-fs-test receipt-path (js/JSON.stringify receipt))
          (is (= :cache-receipt-mismatch
                 (problem #(fs/lookup-mount cache identity))))))))
+
+;; ── version 2: content named by CID ──────────────────────────────────────────
+;;
+;; Version 1 inlines every file, so the largest tree it can DESCRIBE is the
+;; largest answer IPQ will return — 4 MiB. That is a ceiling on the subject
+;; rather than on the response, and it is the one measured against a real site
+;; on 2026-09-23: 40.65 MiB across 600 documents, ten times over, with no
+;; arrangement of selectors that would have helped.
+;;
+;; These fix the two halves that make version 2 safe to add. The manifest is
+;; not trusted — every block is checked against the CID it was asked for, the
+;; size the manifest declared, and the text contract it will be served under.
+;; And the budget that decides whether to fetch at all is answered from the
+;; manifest, before the first fetch.
+
+(defn text->bytes [t]
+  #?(:clj (.getBytes ^String t "UTF-8")
+     :cljs (.encode (js/TextEncoder.) t)))
+
+(defn text-cid [t] (mf/cidv1-raw (text->bytes t)))
+(defn text-size [t] (bytes/bcount (text->bytes t)))
+
+(def referenced-text "alpha\nbeta\nalpha\n")
+(def inline-text "root 😀\n")
+
+(defn port
+  "A block port plus the call counter, so a test can assert that nothing was
+   fetched as well as that something was."
+  [blocks]
+  (let [calls (atom 0)]
+    {:blocks {:get (fn [cid] (swap! calls inc) (get blocks cid))}
+     :calls calls}))
+
+(defn text-port [& texts]
+  (port (into {} (map (fn [t] [(text-cid t) {:bytes (text->bytes t)}])) texts)))
+
+(defn v2-snapshot
+  ([] (v2-snapshot {}))
+  ([{:keys [size cid version]}]
+   {"version" (or version 2)
+    "entries" [{"path" "/workspace" "type" "directory"}
+               {"path" "/workspace/docs" "type" "directory"}
+               {"path" "/workspace/docs/readme.txt" "type" "file"
+                "cid" (or cid (text-cid referenced-text))
+                "size" (or size (text-size referenced-text))}
+               {"path" "/workspace/root.txt" "type" "file" "text" inline-text}]}))
+
+(defn mount-v2 [snapshot options]
+  (let [{:keys [root car-bytes]} (fixture-for snapshot)]
+    (fs/mount (merge {:car-bytes car-bytes :root root :scope-root "/workspace"
+                      :adl-capability (snapshot-adl)}
+                     options))))
+
+(deftest referenced-content-is-fetched-verified-and-served-as-one-entry-shape
+  (let [{:keys [blocks calls]} (text-port referenced-text)
+        mount (mount-v2 (v2-snapshot) {:blocks blocks})]
+    (testing "the referenced file reads exactly like an inline one"
+      (is (= referenced-text (fs/app-data mount "/workspace/docs/readme.txt")))
+      (is (= inline-text (fs/app-data mount "/workspace/root.txt"))))
+    (testing "both forms appear in the same directory listing"
+      (is (= "docs\t1\nroot.txt\t0" (fs/browse mount "/workspace"))))
+    (testing "one block was fetched — the inline entry did not go to the port"
+      (is (= 1 @calls)))
+    (testing "the receipt says what was fetched beyond the root"
+      (is (= {"/workspace/docs/readme.txt" (text-cid referenced-text)}
+             (get-in mount [:receipt :content-cids])))
+      (is (= (text-size referenced-text) (get-in mount [:receipt :referenced-bytes]))))))
+
+(deftest a-manifest-without-a-port-is-refused-by-name-not-mounted-unreadable
+  (is (= :blocks-port-required (problem #(mount-v2 (v2-snapshot) {}))))
+  (testing "a version-1 snapshot still needs no port at all"
+    (is (some? (fs/app-data (mounted) "/workspace/root.txt")))))
+
+(deftest every-block-is-checked-against-the-manifest-that-named-it
+  (testing "bytes that are not the ones named"
+    (let [{:keys [blocks]} (text-port "something else entirely")
+          wrong (:get blocks)]
+      (is (= :content-cid-mismatch
+             (problem #(mount-v2 (v2-snapshot)
+                                 {:blocks {:get (fn [_] (wrong (text-cid "something else entirely")))}}))))))
+  (testing "a size the manifest got wrong"
+    (let [{:keys [blocks]} (text-port referenced-text)]
+      (is (= :content-size-mismatch
+             (problem #(mount-v2 (v2-snapshot {:size (inc (text-size referenced-text))})
+                                 {:blocks blocks}))))))
+  (testing "a block the port does not have"
+    (let [{:keys [blocks]} (text-port "unrelated")]
+      (is (= :content-block-missing
+             (problem #(mount-v2 (v2-snapshot) {:blocks blocks}))))))
+  (testing "bytes that are not UTF-8, under a provider whose contract is text"
+    (let [raw #?(:clj (byte-array [-1 -2]) :cljs (js/Uint8Array.from #js [255 254]))
+          cid (mf/cidv1-raw raw)]
+      (is (= :content-not-utf8
+             (problem #(mount-v2 (v2-snapshot {:cid cid :size 2})
+                                 {:blocks {:get (fn [_] {:bytes raw})}})))))))
+
+(deftest a-manifest-that-disagrees-with-itself-is-refused-before-any-fetch
+  (testing "version 1 cannot name content by CID"
+    (let [{:keys [blocks calls]} (text-port referenced-text)]
+      (is (= :referenced-entry-unsupported
+             (problem #(mount-v2 (v2-snapshot {:version 1}) {:blocks blocks}))))
+      (is (= 0 @calls))))
+  (testing "an entry carrying both text and cid is not a shape with a tie-break"
+    (let [snapshot (update (v2-snapshot) "entries"
+                           (fn [entries]
+                             (mapv (fn [e] (cond-> e
+                                             (contains? e "cid") (assoc "text" "both")))
+                                   entries)))]
+      (is (= :entry-fields (problem #(mount-v2 snapshot {:blocks {:get (fn [_] nil)}}))))))
+  (testing "a CID this provider cannot serve as file bytes is refused as its form"
+    (is (= :content-cid-form
+           (problem #(mount-v2 (v2-snapshot {:cid "bafyreibvjvcv745gig4mvqs4hctx4zfkono4rjejm2ta6gtyzkqxfjeily"})
+                               {:blocks {:get (fn [_] nil)}}))))))
+
+(deftest the-referenced-budget-is-answered-from-the-manifest-before-fetching
+  ;; Both numbers are DERIVED from the published limits: the largest a single
+  ;; referenced file may be, and one more of them than the mount budget
+  ;; admits. Writing either as a literal would make this test pass for the
+  ;; wrong reason the day a limit moves — the first draft chose 8 MiB per
+  ;; file and was refused as :content-size, by the per-file ceiling, before
+  ;; the total was ever reached.
+  (let [per-file (:max-file-bytes fs/limits)
+        n (inc (quot (:max-referenced-bytes fs/limits) per-file))
+        entries (into [{"path" "/workspace" "type" "directory"}]
+                      (map (fn [i]
+                             {"path" (str "/workspace/f" i ".txt") "type" "file"
+                              "cid" (text-cid (str "file-" i)) "size" per-file}))
+                      (range n))
+        {:keys [blocks calls]} (text-port referenced-text)]
+    (testing "one file past the budget is refused, and nothing was fetched"
+      (is (> (* n per-file) (:max-referenced-bytes fs/limits)))
+      (is (= :referenced-content-limit
+             (problem #(mount-v2 {"version" 2 "entries" entries} {:blocks blocks}))))
+      (is (= 0 @calls)))))
+
+(deftest a-tree-larger-than-one-response-is-now-describable
+  (let [per-file 1048576
+        n 8
+        total (* per-file n)
+        entries (into [{"path" "/workspace" "type" "directory"}]
+                      (map (fn [i]
+                             {"path" (str "/workspace/big" i ".txt") "type" "file"
+                              "cid" (text-cid (str "big-" i)) "size" per-file}))
+                      (range n))
+        {:keys [blocks calls]} (text-port "nothing this manifest names")]
+    (testing "the manifest totals more content than version 1 could hold at all"
+      (is (> total (:max-inline-content-bytes fs/limits))))
+    (testing "and it passes every ceiling, reaching the fetch it cannot satisfy here"
+      ;; :content-block-missing rather than a limit refusal is the assertion:
+      ;; an 8 MiB tree got past the ceiling that would have stopped it in
+      ;; version 1 and was refused only for the block this test declines to
+      ;; provide.
+      (is (= :content-block-missing
+             (problem #(mount-v2 {"version" 2 "entries" entries} {:blocks blocks}))))
+      (is (= 1 @calls)))))

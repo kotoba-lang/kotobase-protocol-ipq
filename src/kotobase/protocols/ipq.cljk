@@ -61,7 +61,24 @@
   Published rather than merely enforced: a client that cannot read the budget
   before it builds a selector can only discover it by being refused, and a
   refusal it did not anticipate is indistinguishable from a server fault. The
-  descriptor at `/ipq/v1` carries these numbers."
+  descriptor at `/ipq/v1` carries these numbers.
+
+  WHICH OF THESE IS MEASURED. `:max-blocks` is: see `unpacked-limits` below
+  for the 2026-09-11 numbers that chose 256 and 32, and for why a wider one
+  would be the absence of a ceiling rather than a larger one.
+
+  `:max-bytes` is NOT. It shipped in the first IPQ/1 commit and no
+  measurement has been attached to it since, which is worth saying out loud
+  because it sits in the same map as a number that was argued for, and a
+  reader has no way to tell them apart. What would settle it: the answer is
+  assembled whole — `ipld.car/encode` ends in a concat, and the deploy shell
+  caches every block before the handler runs — so the ceiling that matters is
+  peak memory in the Worker isolate against the concurrency it serves, and
+  nobody has measured that.
+
+  It is also not the number that bounds a TREE. A filesystem snapshot that
+  inlined its files was bounded by this budget; one that names them by CID is
+  not (`kotobase.protocols.ipq.fs`, snapshot version 2)."
   {:max-blocks 256
    :max-bytes 4194304
    :max-depth 32
