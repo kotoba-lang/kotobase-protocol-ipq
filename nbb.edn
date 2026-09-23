@@ -10,6 +10,9 @@
         io.github.kotoba-lang/io-ipld
         {:git/url "https://github.com/kotoba-lang/io-ipld.git"
          :git/sha "1b21025327e63652e533b54303b5e7b8e11f59ba"}
+        io.github.kotoba-lang/io-multiformats
+        {:git/url "https://github.com/kotoba-lang/io-multiformats.git"
+         :git/sha "dbb877ed22e87ba68d74d995dd8cbe6cf8f24970"}
         io.github.kotoba-lang/io-ipld-car
         {:git/url "https://github.com/kotoba-lang/io-ipld-car.git"
          :git/sha "6a67a81f2c47e8dc5945c19d289a9043afdbb2eb"}}}
