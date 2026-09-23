@@ -1,5 +1,5 @@
 (ns kotobase.protocols.ipq-fs-cli-test
-  (:require [cljs.test :refer [deftest is]]
+  (:require [cljs.test :refer [deftest is testing]]
             [kotobase.protocols.ipq.fs-cli :as cli]
             [kotobase.protocols.ipq-fs-test :as fixture]
             [ipld.car.bytes :as bytes]
@@ -200,3 +200,68 @@
                   (js/Buffer.from (.repeat "0123456789" 10000) "utf8")]]
     (is (re-matches #"^bafkrei[a-z2-7]{52}$" (mf/cidv1-raw (bytes/as-bytes sample)))
         (str "a well-formed raw CIDv1 for " (.-length sample) " bytes"))))
+
+(deftest a-path-list-snapshots-exactly-what-it-names
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-paths-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        blocks (.join node-path temp "blocks")
+        listed (.join node-path temp "paths.txt")]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "wanted.txt") "a\n")
+      (.writeFileSync node-fs (.join node-path docs "wanted.txt") "b\n")
+      (.writeFileSync node-fs (.join node-path tree "ignored.bin") "c\n")
+      (.writeFileSync node-fs listed
+                      "# the two documents, not the third file\nwanted.txt\ndocs/wanted.txt\n")
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                               "--car" (.join node-path temp "a.car")
+                               "--blocks-dir" blocks "--paths" listed])]
+        (is (= 2 (:files written)) "only the listed files")
+        (is (= 4 (:entries written)) "plus /w and /w/docs")
+        (is (= 2 (count (js->clj (.readdirSync node-fs blocks))))
+            "and only their blocks were written"))
+
+      (testing "a path that is not there is refused, never skipped"
+        (.writeFileSync node-fs listed "wanted.txt\ndocs/gone.txt\n")
+        (is (= :no-such-path
+               (problem #(cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                                    "--car" (.join node-path temp "b.car")
+                                    "--blocks-dir" blocks "--paths" listed])))))
+
+      (testing "and a path that would leave the tree is refused as its shape"
+        (.writeFileSync node-fs listed "../escape.txt\n")
+        (is (= :unusable-path
+               (problem #(cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                                    "--car" (.join node-path temp "c.car")
+                                    "--blocks-dir" blocks "--paths" listed])))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest naming-every-file-gives-the-same-cid-as-walking-for-them
+  ;; The root CID is a function of the encoded entries, so the two routes
+  ;; have to agree about their order or the same tree would have two
+  ;; identities depending on which flag produced it.
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-same-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        listed (.join node-path temp "paths.txt")]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "b.txt") "b\n")
+      (.writeFileSync node-fs (.join node-path tree "a.txt") "a\n")
+      (.writeFileSync node-fs (.join node-path docs "c.txt") "c\n")
+      (.writeFileSync node-fs listed "b.txt\na.txt\ndocs/c.txt\n")
+      (let [walked (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                              "--car" (.join node-path temp "w.car")
+                              "--blocks-dir" (.join node-path temp "wb")])
+            named (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                             "--car" (.join node-path temp "n.car")
+                             "--blocks-dir" (.join node-path temp "nb")
+                             "--paths" listed])]
+        (is (= (:entries walked) (:entries named)))
+        (is (= (:root walked) (:root named))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
