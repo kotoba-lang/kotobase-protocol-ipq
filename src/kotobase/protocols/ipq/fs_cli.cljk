@@ -2,10 +2,13 @@
   "Agent/toolcall entrypoint for materializing one verified IPQ filesystem CAR."
   (:require [cljs.reader :as reader]
             [clojure.string :as str]
+            [ipld.car :as car]
             [ipld.car.bytes :as bytes]
             [ipld.core :as ipld]
-            [kotobase.protocols.ipq.fs :as fs]))
+            [kotobase.protocols.ipq.fs :as fs]
+            [multiformats.core :as mf]))
 
+(def node-crypto (js/require "node:crypto"))
 (def node-fs (js/require "node:fs"))
 (def node-path (js/require "node:path"))
 (def child-process (js/require "node:child_process"))
@@ -32,11 +35,14 @@
    "--scope-root" :scope-root
    "--cache-root" :cache-root
    "--project" :project
-   "--snapshot" :snapshot})
+   "--snapshot" :snapshot
+   "--tree" :tree
+   "--blocks-dir" :blocks-dir})
 
 (def command-options
-  {"materialize" #{:car :root :scope-root :cache-root}
-   "git-materialize" #{:car :project :snapshot :cache-root}})
+  {"materialize" #{:car :root :scope-root :cache-root :blocks-dir}
+   "git-materialize" #{:car :project :snapshot :cache-root :blocks-dir}
+   "snapshot" #{:tree :scope-root :car :blocks-dir}})
 
 (defn refuse! [problem message data]
   (throw (ex-info message (assoc data :phase :ipq-fs-cli :problem problem))))
@@ -64,9 +70,21 @@
                            (string? (:project options))
                            (string? (:snapshot options)))
               (refuse! :required-option "--car, --project, and --snapshot are required"
+                       {:options (keys options)}))
+
+            "snapshot"
+            ;; --blocks-dir is required, not optional. Every entry this
+            ;; writer emits NAMES its bytes, so a run that put them nowhere
+            ;; has produced a manifest describing content no reader can
+            ;; reach. Making it optional would let the writer succeed at
+            ;; producing something unusable.
+            (when-not (and (string? (:tree options)) (string? (:car options))
+                           (string? (:blocks-dir options)))
+              (refuse! :required-option "--tree, --car and --blocks-dir are required"
                        {:options (keys options)})))
           (cond-> options
-            (= "materialize" command) (assoc :scope-root (or (:scope-root options) "/"))))
+            (contains? #{"materialize" "snapshot"} command)
+            (assoc :scope-root (or (:scope-root options) "/"))))
         (let [[flag value & more] remaining
               option (get option-spec flag)]
           (when-not option
@@ -145,13 +163,149 @@
        :git-snapshot snapshot
        :git-manifest git-manifest-path})))
 
-(defn materialize! [{:keys [car root scope-root cache-root] :as options}]
+(defn directory-block-port
+  "A block port over a local directory of `<cid>` files — the same layout the
+   bytes plane stores at `ipld/{cid}`.
+
+  Fetch authority stays outside this command, which is why this exists at all:
+  the host puts blocks somewhere on disk by whatever means it is entitled to,
+  and the CLI reads them. It never opens a socket.
+
+  `cid` cannot escape the directory: `fs/validate-snapshot!` has already
+  refused any entry whose CID is not `bafkrei` + 52 base32 characters, and
+  resolution runs after validation."
+  [dir]
+  {:get (fn [cid]
+          (let [file (.join node-path dir cid)]
+            (when (.existsSync node-fs file)
+              {:bytes (.readFileSync node-fs file)})))})
+
+(defn raw-cid
+  "The raw CIDv1 of these bytes, with the DIGEST taken by the runtime.
+
+  `multiformats.core/cidv1-raw` does this in one call, and its sha2-256 is
+  portable ClojureScript that the SCI runtime interprets. Measured 2026-09-23
+  on 82 real documents (3.08 MB): reading them cost 60 ms in total and
+  hashing them cost 16,595 ms — 202 ms per file, 276 times the I/O. A writer
+  for a site-sized tree cannot pay that.
+
+  Only the digest moves. The CID is still ASSEMBLED by multiformats, from
+  the multihash prefix it defines, so this cannot drift into a second way of
+  naming the same bytes — `the-fast-cid-is-the-same-cid` asserts the two
+  agree on real content."
+  [buf]
+  (let [digest (-> (.createHash node-crypto "sha256") (.update buf) (.digest))
+        multihash (js/Uint8Array. (+ 2 (.-length digest)))]
+    (aset multihash 0 0x12)
+    (aset multihash 1 0x20)
+    (.set multihash digest 2)
+    (mf/cidv1 mf/codec-raw multihash)))
+
+(defn- refuse-unusable-name! [name]
+  (when (or (str/includes? name "/") (str/includes? name "\n")
+            (str/includes? name "\t") (= name ".") (= name ".."))
+    (refuse! :unusable-name
+             "a file name cannot appear in a canonical snapshot path"
+             {:name name})))
+
+(defn- collect-entries!
+  "Walk a real directory into snapshot entries, writing each file's block into
+   `blocks-dir` on the way when one is given.
+
+  Every file becomes a REFERENCED entry. Inlining small files would be a
+  legitimate option — version 1 is better for a tree that fits in a block —
+  but a writer that sometimes inlines produces two shapes for the same input
+  depending on a threshold, and there is no measurement here saying where to
+  put it."
+  [tree scope-root blocks-dir]
+  (let [entries (atom [{"path" scope-root "type" "directory"}])
+        bytes-total (atom 0)]
+    (letfn [(count-entry! []
+              ;; Checked DURING the walk, not after it. Blocks are written as
+              ;; they are read, so a tree that is over the limit would
+              ;; otherwise pay for a full copy of its content before being
+              ;; told. Measured on a real site: 27,431 files, 213 MiB, all
+              ;; written before a refusal that the first 4,097 entries had
+              ;; already decided.
+              (when (> (count @entries) fs/max-entries)
+                (refuse! :entry-limit
+                         "this tree has more entries than one snapshot admits"
+                         {:maximum fs/max-entries :reached (count @entries)})))
+            (walk [abs prefix]
+              (doseq [name (sort (js->clj (.readdirSync node-fs abs)))]
+                (refuse-unusable-name! name)
+                (let [child (.join node-path abs name)
+                      path (str prefix "/" name)
+                      stat (.lstatSync node-fs child)]
+                  (cond
+                    (.isSymbolicLink stat)
+                    (refuse! :symlink "a snapshot cannot carry a symbolic link"
+                             {:path path})
+
+                    (.isDirectory stat)
+                    (do (swap! entries conj {"path" path "type" "directory"})
+                        (count-entry!)
+                        (walk child path))
+
+                    (.isFile stat)
+                    (let [buf (.readFileSync node-fs child)
+                          cid (raw-cid buf)]
+                      (when blocks-dir
+                        (.writeFileSync node-fs (.join node-path blocks-dir cid) buf))
+                      (swap! bytes-total + (.-byteLength buf))
+                      (swap! entries conj {"path" path "type" "file"
+                                           "cid" cid "size" (.-byteLength buf)})
+                      (count-entry!))
+
+                    :else
+                    (refuse! :not-regular
+                             "a snapshot carries regular files and directories only"
+                             {:path path})))))]
+      (walk tree scope-root))
+    {:entries @entries :bytes @bytes-total}))
+
+(defn snapshot!
+  "A real directory becomes one CID-fixed manifest CAR."
+  [{:keys [tree scope-root car blocks-dir]}]
+  (when-not (.existsSync node-fs tree)
+    (refuse! :no-tree "there is no such directory to snapshot" {:tree tree}))
+  (when blocks-dir
+    (.mkdirSync node-fs blocks-dir #js {:recursive true}))
+  (let [{:keys [entries bytes]} (collect-entries! tree scope-root blocks-dir)
+        logical {"version" fs/snapshot-write-version "entries" entries}
+        representation (ipld/encode logical)
+        root (mf/cidv1-raw representation)
+        encoded (car/encode {:roots [root]
+                             :blocks [{:cid root :bytes representation}]})]
+    (.writeFileSync node-fs car (:bytes encoded))
+    ;; Read it back through the reader that will read it in production. A
+    ;; writer verified only by its own arithmetic is a writer nobody has
+    ;; checked — and when `blocks-dir` was given, this also proves every
+    ;; block it just wrote resolves.
+    (let [verified (fs/mount (cond-> {:car-bytes (:bytes encoded)
+                                      :root root
+                                      :scope-root scope-root
+                                      :adl-capability (snapshot-adl-capability)}
+                               blocks-dir (assoc :blocks (directory-block-port blocks-dir))))]
+      {:status :snapshot
+       :root root
+       :scope-root scope-root
+       :car car
+       :blocks-dir blocks-dir
+       :entries (count entries)
+       :files (count (filter #(= "file" (get % "type")) entries))
+       :referenced-bytes bytes
+       :manifest-bytes (bytes/bcount representation)
+       :verified-entries (count (:entries verified))})))
+
+(defn materialize! [{:keys [car root scope-root cache-root blocks-dir] :as options}]
   (when cache-root
     (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) cache-root))
-  (let [mount (fs/mount {:car-bytes (.readFileSync node-fs car)
-                         :root root
-                         :scope-root scope-root
-                         :adl-capability (snapshot-adl-capability)})
+  (let [mount (fs/mount (cond-> {:car-bytes (.readFileSync node-fs car)
+                                 :root root
+                                 :scope-root scope-root
+                                 :adl-capability (snapshot-adl-capability)}
+                          blocks-dir (assoc :blocks (directory-block-port blocks-dir))))
         files (count (filter (fn [[_ entry]] (= "file" (get entry "type")))
                              (:entries mount)))]
     (merge {:status :materialized
@@ -168,4 +322,5 @@
   (let [{:keys [command] :as options} (parse-args argv)]
     (case command
       "materialize" (materialize! options)
-      "git-materialize" (materialize! (merge options (read-git-snapshot! options))))))
+      "git-materialize" (materialize! (merge options (read-git-snapshot! options)))
+      "snapshot" (snapshot! options))))

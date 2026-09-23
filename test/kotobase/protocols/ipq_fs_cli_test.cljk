@@ -1,7 +1,9 @@
 (ns kotobase.protocols.ipq-fs-cli-test
   (:require [cljs.test :refer [deftest is]]
             [kotobase.protocols.ipq.fs-cli :as cli]
-            [kotobase.protocols.ipq-fs-test :as fixture]))
+            [kotobase.protocols.ipq-fs-test :as fixture]
+            [ipld.car.bytes :as bytes]
+            [multiformats.core :as mf]))
 
 (def node-fs (js/require "node:fs"))
 (def node-path (js/require "node:path"))
@@ -100,3 +102,94 @@
       (finally
         (fixture/test-make-writable! temp)
         (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest snapshot-command-round-trips-a-real-directory-including-binary
+  ;; The writer is checked by the reader, on real files, through the disk.
+  ;; A writer verified only by its own arithmetic is a writer nobody checked.
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-snap-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        blocks (.join node-path temp "blocks")
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")
+        ;; A PNG signature followed by bytes that are not UTF-8 at all.
+        binary (js/Uint8Array.from #js [137 80 78 71 13 10 26 10 0 255 254 253])]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "readme.txt") "alpha\nbeta\n")
+      (.writeFileSync node-fs (.join node-path docs "utf8.txt") "hello 😀\n")
+      (.writeFileSync node-fs (.join node-path docs "logo.png") binary)
+      ;; 200 KB, so the next assertion is about the DESIGN and not about
+      ;; which of two small numbers happens to be larger.
+      (.writeFileSync node-fs (.join node-path tree "big.txt")
+                      (.repeat "0123456789" 20480))
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/workspace"
+                               "--car" car-file "--blocks-dir" blocks])]
+        (is (= :snapshot (:status written)))
+        (is (= 4 (:files written)))
+        (is (= 6 (:entries written)) "four files, the scope root, and docs")
+        (is (re-matches #"^bafkrei[a-z2-7]{52}$" (:root written)))
+        (is (= 4 (count (js->clj (.readdirSync node-fs blocks))))
+            "one block per file, named by its CID")
+        (is (> (:referenced-bytes written) 204800))
+        (is (< (:manifest-bytes written) 1024)
+            "the manifest grows with the NUMBER of files, not their bytes -- this
+             is the whole property, and version 1 would have had to carry all
+             204,834 of them inside the block being validated")
+
+        (let [receipt (cli/run! ["materialize" "--car" car-file "--root" (:root written)
+                                 "--scope-root" "/workspace" "--blocks-dir" blocks
+                                 "--cache-root" cache-root])
+              local (:local-root receipt)
+              same? (fn [there original]
+                      (let [got (.readFileSync node-fs there)]
+                        (= (vec (array-seq got)) (vec (array-seq original)))))]
+          (is (= :materialized (:status receipt)))
+          (is (same? (.join node-path local "readme.txt")
+                     (.readFileSync node-fs (.join node-path tree "readme.txt"))))
+          (is (same? (.join node-path local "big.txt")
+                     (.readFileSync node-fs (.join node-path tree "big.txt"))))
+          (is (same? (.join node-path local "docs" "utf8.txt")
+                     (.readFileSync node-fs (.join node-path docs "utf8.txt"))))
+          (is (same? (.join node-path local "docs" "logo.png") (js/Buffer.from binary))
+              "the binary file survives the round trip byte for byte")))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest a-referenced-manifest-without-blocks-refuses-rather-than-materializing-half
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-snap2-"))
+        tree (.join node-path temp "tree")
+        blocks (.join node-path temp "blocks")
+        car-file (.join node-path temp "snapshot.car")]
+    (try
+      (.mkdirSync node-fs tree #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "a.txt") "a\n")
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                               "--car" car-file "--blocks-dir" blocks])]
+        (is (= :blocks-port-required
+               (problem #(cli/run! ["materialize" "--car" car-file
+                                    "--root" (:root written) "--scope-root" "/w"
+                                    "--cache-root" (.join node-path temp "cache")]))))
+        (is (= :content-block-missing
+               (problem #(cli/run! ["materialize" "--car" car-file
+                                    "--root" (:root written) "--scope-root" "/w"
+                                    "--blocks-dir" (.join node-path temp "empty")
+                                    "--cache-root" (.join node-path temp "cache2")])))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest the-fast-cid-is-the-same-cid
+  ;; cli/raw-cid takes the digest from node:crypto because the portable one
+  ;; costs 202 ms a file under SCI. That is only an optimisation if the
+  ;; string is identical, so it is checked against the library on content
+  ;; shaped like the content this writer sees: empty, tiny, multi-byte UTF-8,
+  ;; binary, and larger than one hash block.
+  (doseq [sample [(js/Uint8Array. 0)
+                  (js/Buffer.from "a" "utf8")
+                  (js/Buffer.from "hello 😀\n" "utf8")
+                  (js/Uint8Array.from #js [137 80 78 71 13 10 26 10 0 255 254 253])
+                  (js/Buffer.from (.repeat "0123456789" 10000) "utf8")]]
+    (is (= (mf/cidv1-raw (bytes/as-bytes sample)) (cli/raw-cid sample))
+        (str "same CID for " (.-length sample) " bytes"))))

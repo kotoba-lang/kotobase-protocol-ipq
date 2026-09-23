@@ -54,6 +54,35 @@
 
 (def ^:const default-cache-capacity 16)
 
+(def ^:const max-entries 4096)
+
+(def ^:const max-entry-nodes
+  "The most logical nodes ONE entry can occupy.
+
+  A referenced file entry is a map plus four keys and four values — nine. An
+  inline file is seven, a directory five. The budget has to admit the largest,
+  and this constant exists so the two ceilings cannot drift apart again.
+
+  They did drift. `:max-adl-output-nodes` was a literal 32,768, and when
+  version 2 added two keys to a file entry it silently became the binding
+  ceiling: measured 2026-09-23, a snapshot of 4,000 REFERENCED entries was
+  refused `:adl-output-nodes-exceeded` while `:max-entries` = 4,096 never got
+  to decide, and 4,000 INLINE entries mounted. That is the same failure the
+  note beside the old literal was written about the last time it happened,
+  which is the argument for deriving it rather than writing the answer down
+  again."
+  9)
+
+(def ^:const snapshot-wrapper-nodes
+  "The value AROUND the entries: the snapshot map, its two keys, the version
+   scalar, and the entries vector — five.
+
+  Left out of the first derivation, and the arithmetic missed by two: a
+  snapshot of exactly `max-entries` referenced entries needed 36,869 output
+  nodes against a budget of 36,864. Close enough to look like a rounding
+  argument, which is why it is written as a term instead."
+  5)
+
 (def limits
   "The logical expansion budget after IPQ's own four traversal budgets.
 
@@ -81,17 +110,25 @@
 
   `:max-file-bytes` bounds ONE referenced file, because that block has to come
   back inside one IPQ selection. Derived, for the same reason as the first."
-  {:max-entries 4096
+  {:max-entries max-entries
    :max-inline-content-bytes (:max-bytes ipq/limits)
    :max-referenced-bytes 67108864
    :max-file-bytes (:max-bytes ipq/limits)
    :adl {:max-depth 32
          :max-nodes 16384
          :max-adl-fuel 1000000
-         ;; One exact file entry occupies seven logical nodes (map, three
-         ;; keys, three values).  16,384 therefore rejected an otherwise
-         ;; valid snapshot before :max-entries=4096 could make the decision.
-         :max-adl-output-nodes 32768
+         ;; Derived, so that `:max-entries` is the ceiling that DECIDES. A
+         ;; budget which refuses a snapshot before the declared entry limit
+         ;; can speak is not a second safeguard, it is the first one wearing
+         ;; someone else's name.
+         ;;
+         ;; ONE MORE than the limit, at the widest entry shape: the ADL
+         ;; expands before entries can be counted, so a snapshot that is over
+         ;; by one has to fit here in order to be refused as `:entry-limit`
+         ;; rather than as an expansion budget. Nine nodes of headroom buys
+         ;; the refusal its right name in both entry shapes.
+         :max-adl-output-nodes (+ snapshot-wrapper-nodes
+                                  (* (inc max-entries) max-entry-nodes))
          :max-adl-output-bytes 4194304
          :check-adl-determinism? true}})
 
@@ -335,14 +372,24 @@
                   {:path path :cid cid :declared declared :actual actual}))
          ;; Invalid UTF-8 decodes to U+FFFD, three bytes where one stood, so
          ;; the re-encoded length is strictly larger whenever replacement
-         ;; happened. That makes this an exact test on both runtimes rather
-         ;; than a decoder flag that only one of them has.
+         ;; happened — an exact test on both runtimes, rather than a decoder
+         ;; flag only one of them has.
+         ;;
+         ;; What follows from it is a CLASSIFICATION, not a refusal. A
+         ;; filesystem snapshot that cannot hold a PNG is not describing
+         ;; filesystems, and the reason to refuse binary here was never the
+         ;; snapshot: it was wire 35, whose result type is a string. So the
+         ;; bytes are kept and the refusal moves to the one operation that
+         ;; genuinely cannot serve them — `app-data` :read. Everything else a
+         ;; caller does with a binary file (browse, EXISTS, STAT, and reading
+         ;; it off the materialized tree with ordinary tools, which is what
+         ;; ADR-2609063500 says agents do) works.
          (let [text (utf8-text raw)]
-           (when-not (= (utf8-byte-count text) actual)
-             (fail! :content-not-utf8
-                    "IPQ filesystem content block is not valid UTF-8 and this provider serves text"
-                    {:path path :cid cid}))
-           (assoc acc path (-> entry (dissoc "cid" "size") (assoc "text" text)))))))
+           (assoc acc path
+                  (if (= (utf8-byte-count text) actual)
+                    (-> entry (dissoc "cid" "size") (assoc "text" text))
+                    (-> entry (dissoc "cid" "size")
+                        (assoc "bytes" raw "encoding" "binary"))))))))
    by-path
    referenced))
 
@@ -395,12 +442,20 @@
 (defn- strip-suffix [value suffix]
   (subs value 0 (- (count value) (count suffix))))
 
+(defn- binary-entry? [entry]
+  (= "binary" (get entry "encoding")))
+
+(defn- entry-byte-count [entry]
+  (if (binary-entry? entry)
+    (bytes/bcount (get entry "bytes"))
+    (utf8-byte-count (get entry "text"))))
+
 (defn- stat-response [mount entry]
   (str "0 " (if (= "file" (get entry "type"))
                #?(:cljs (if (:local-root mount)
                           (disk/stat-size mount (get entry "path"))
-                          (utf8-byte-count (get entry "text")))
-                  :clj (utf8-byte-count (get entry "text")))
+                          (entry-byte-count entry))
+                  :clj (entry-byte-count entry))
                0)
        " 0 " (if (= "directory" (get entry "type")) "1" "0")))
 
@@ -432,6 +487,14 @@
                 (nil? entry) (fail! :not-found "fs/app-data target does not exist" {:path path})
                 (= "directory" (get entry "type"))
                 (fail! :is-directory "fs/app-data cannot read a directory" {:path path})
+                ;; Wire 35's result type is a string. A binary file is in the
+                ;; snapshot, is listed, and STATs correctly — it just cannot
+                ;; come back through THIS port, and says so rather than
+                ;; arriving as replacement characters that look like content.
+                (binary-entry? entry)
+                (fail! :binary-content
+                       "fs/app-data cannot read a binary file through a string provider"
+                       {:path path :bytes (entry-byte-count entry)})
                 :else #?(:cljs (if (:local-root mount)
                                  (disk/read-text mount path)
                                  (get entry "text"))
