@@ -345,12 +345,38 @@
     (let [{:keys [blocks]} (text-port "unrelated")]
       (is (= :content-block-missing
              (problem #(mount-v2 (v2-snapshot) {:blocks blocks}))))))
-  (testing "bytes that are not UTF-8, under a provider whose contract is text"
+  (testing "a size the manifest got right for bytes that are not text"
+    ;; Non-UTF-8 is not a refusal here — see the binary test below — so the
+    ;; size check has to be what catches a wrong one, on any bytes.
     (let [raw #?(:clj (byte-array [-1 -2]) :cljs (js/Uint8Array.from #js [255 254]))
           cid (mf/cidv1-raw raw)]
-      (is (= :content-not-utf8
-             (problem #(mount-v2 (v2-snapshot {:cid cid :size 2})
+      (is (= :content-size-mismatch
+             (problem #(mount-v2 (v2-snapshot {:cid cid :size 3})
                                  {:blocks {:get (fn [_] {:bytes raw})}})))))))
+
+(deftest a-binary-file-is-described-and-listed-and-refused-only-where-it-cannot-be-served
+  (let [raw #?(:clj (byte-array [-1 -2 0 -3])
+               :cljs (js/Uint8Array.from #js [255 254 0 253]))
+        cid (mf/cidv1-raw raw)
+        mount (mount-v2 (v2-snapshot {:cid cid :size 4})
+                        {:blocks {:get (fn [_] {:bytes raw})}})]
+    (testing "it is in the tree, listed, and STATs at its real size"
+      (is (= "1" (fs/app-data mount "/workspace/docs/readme.txtEXISTS_SEP")))
+      (is (= "0 4 0 0" (fs/app-data mount "/workspace/docs/readme.txtSTAT_SEP")))
+      (is (= "readme.txt\t0" (fs/browse mount "/workspace/docs"))))
+    (testing "the string port refuses it by name instead of serving U+FFFD"
+      (is (= :binary-content (problem #(fs/app-data mount "/workspace/docs/readme.txt")))))
+    (testing "and its bytes on the materialized tree are the bytes"
+      ;; The point of keeping it: ADR-2609063500 has agents read the
+      ;; materialized tree with ordinary tools. A byte that did not survive
+      ;; the write would make that tree a different tree from the one whose
+      ;; CID was verified.
+      #?(:cljs
+         (let [on-disk (.readFileSync node-fs-test
+                                      (.join node-path-test (:local-root mount)
+                                             "docs" "readme.txt"))]
+           (is (= 4 (.-length on-disk)))
+           (is (= [255 254 0 253] (vec (array-seq on-disk)))))))))
 
 (deftest a-manifest-that-disagrees-with-itself-is-refused-before-any-fetch
   (testing "version 1 cannot name content by CID"
@@ -411,3 +437,28 @@
       (is (= :content-block-missing
              (problem #(mount-v2 {"version" 2 "entries" entries} {:blocks blocks}))))
       (is (= 1 @calls)))))
+
+(deftest the-entry-limit-decides-for-referenced-entries-too
+  ;; The v1 case is covered above. This is the same claim for the WIDEST
+  ;; entry shape, which is the one that broke it: a referenced entry is nine
+  ;; logical nodes where an inline one is seven, so a literal output-node
+  ;; budget sized for inline entries refused a full referenced manifest
+  ;; before `:max-entries` could speak. Both numbers here come from the
+  ;; published limit so the test cannot drift away from it.
+  (letfn [(logical [file-count]
+            {"version" 2
+             "entries"
+             (into [{"path" "/workspace" "type" "directory"}]
+                   (map (fn [i] {"path" (str "/workspace/f" i) "type" "file"
+                                 "cid" (text-cid referenced-text)
+                                 "size" (text-size referenced-text)}))
+                   (range file-count))})
+          (attempt [file-count]
+            (let [{:keys [root car-bytes]} (fixture-for (logical file-count))
+                  {:keys [blocks]} (text-port referenced-text)]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl) :blocks blocks})))]
+    (is (= fs/max-entries (count (:entries (attempt (dec fs/max-entries)))))
+        "a full manifest of the widest entry shape is admitted")
+    (is (= :entry-limit (problem #(attempt fs/max-entries)))
+        "and one more is refused by the DECLARED limit, not by an expansion budget")))

@@ -79,6 +79,28 @@ turn out to be unreadable a call later. Every block is then checked against the
 CID it was asked for, the size the manifest declared, and the text contract it
 will be served under, each with its own refusal.
 
+### Writing one
+
+```bash
+kbb --backend sci bin/ipq_fs_materialize.cljk snapshot \
+  --tree ./public --scope-root /public \
+  --car snapshot.car --blocks-dir ./blocks
+
+kbb --backend sci bin/ipq_fs_materialize.cljk materialize \
+  --car snapshot.car --root bafkrei… --scope-root /public \
+  --blocks-dir ./blocks
+```
+
+`--blocks-dir` is a directory of `<cid>` files — the same layout the bytes
+plane stores at `ipld/{cid}`, so a host that has fetched blocks by whatever
+means it is entitled to can point the CLI at them. Fetch authority stays
+outside this command: it opens no sockets, here or anywhere.
+
+It is required when writing, because every entry this writer emits NAMES its
+bytes; a run that put them nowhere would have produced a manifest describing
+content no reader can reach. The writer then mounts what it just wrote,
+through the same reader production uses, before reporting success.
+
 Both versions are read; version 2 is written. Budgets follow the same split —
 `:max-inline-content-bytes` is derived from IPQ's per-response ceiling because
 those bytes are already in hand, while `:max-referenced-bytes` bounds what a
