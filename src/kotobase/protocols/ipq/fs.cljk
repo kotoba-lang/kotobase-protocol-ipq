@@ -12,7 +12,7 @@
   `find`, `grep`, and the other Kotoba commands therefore keep their existing
   capability calls.  The host chooses this provider instead of a local-filesystem
   provider; the guest never receives ambient network or block-store authority."
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [ipld.car.bytes :as bytes]
             [ipld.car.trustless :as trustless]
             [ipld.schema :as schema]
@@ -157,7 +157,7 @@
                                  :problem problem))))
 
 (defn- utf8-byte-count [text]
-  #?(:clj (alength (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8))
+  #?(:clj (alength (kbytes/utf8-bytes ^String text))
      :cljs (.-length (.encode (js/TextEncoder.) text))))
 
 (defn- forbidden-path-text? [path]
@@ -336,7 +336,7 @@
                    by-path)))
 
 (defn- utf8-text [b]
-  #?(:clj (String. ^bytes (bytes/as-bytes b) "UTF-8")
+  #?(:clj (kbytes/utf8-string ^bytes (bytes/as-bytes b))
      :cljs (.decode (js/TextDecoder. "utf-8") (bytes/as-bytes b))))
 
 (defn- resolve-content!

@@ -1,5 +1,5 @@
 (ns kotobase.protocols.ipq-fs-test
-  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.bytes :as kbytes] #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing use-fixtures]])
             [ipld.car.bytes :as bytes]
             [ipld.car :as car]
@@ -81,7 +81,7 @@
 
 (defn problem [f]
   (try (do (f) nil)
-       (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) e
+       (catch js/Error e
          (or (:problem (ex-data e)) (:type (ex-data e))))))
 
 (deftest ipq-car-adl-and-filesystem-capabilities-form-one-verified-path
@@ -272,7 +272,7 @@
 ;; manifest, before the first fetch.
 
 (defn text->bytes [t]
-  #?(:clj (.getBytes ^String t "UTF-8")
+  #?(:clj (kbytes/utf8-bytes ^String t)
      :cljs (.encode (js/TextEncoder.) t)))
 
 (defn text-cid [t] (mf/cidv1-raw (text->bytes t)))
