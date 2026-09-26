@@ -1,0 +1,85 @@
+(ns multiformats.base32
+  "Lightweight RFC 4648 base32 codec used by CID wire adapters.
+
+  This namespace deliberately has no hashing or npm dependency. Consumers that
+  only parse or re-emit an existing CID must not load the SHA implementation.
+
+  Both directions carry a bit accumulator across the input rather than
+  materialising the bit stream. The first implementation expanded every byte
+  into eight lazy-seq elements, `partition`ed those into fives, and rebuilt
+  each group with `concat`/`repeat`/`count`/`reduce`. That is 288 seq elements
+  and 58 intermediate collections for one 36-byte CID, and it is the reason a
+  DAG-CBOR block decode was dominated by its links rather than its bytes:
+  measured 2026-09-05, `ipld/decode` of a real 30 KB catalog directory
+  containing 643 links spent 97 ms of its 124 ms inside `encode`, which made
+  a Cloudflare Worker poll that returns an empty list cost 760 ms of CPU
+  (ADR-2609051700). Same output, byte for byte -- `base32_test.cljc` holds the
+  RFC 4648 vectors plus a 344-case differential against the old expansion."
+  {:kotoba/export [decode encode]}
+  (:refer-clojure :exclude [decode]))
+
+(def ^:private alphabet "abcdefghijklmnopqrstuvwxyz234567")
+(def ^:private alphabet-index
+  (into {} (map-indexed (fn [i c] [c i]) alphabet)))
+
+(defn- alphabet-char [i]
+  #?(:clj (.charAt ^String alphabet (int i))
+     :cljs (.charAt alphabet i)))
+
+(defn- char-at [s i]
+  #?(:clj (.charAt ^String s (int i))
+     :cljs (.charAt s i)))
+
+(defn- drain-5
+  "Emit every whole 5-bit group the accumulator holds, low bits kept."
+  [buffer bits out]
+  (loop [buffer buffer bits bits out out]
+    (if (>= bits 5)
+      (let [remaining (- bits 5)]
+        (recur (bit-and buffer (dec (bit-shift-left 1 remaining)))
+               remaining
+               (conj! out (alphabet-char
+                           (bit-and (bit-shift-right buffer remaining) 31)))))
+      [buffer bits out])))
+
+(defn encode
+  "Bytes to lowercase RFC 4648 base32 without padding."
+  [bytes]
+  (loop [xs (seq bytes) buffer 0 bits 0 out (transient [])]
+    (if xs
+      (let [[buffer bits out]
+            (drain-5 (bit-or (bit-shift-left buffer 8)
+                             (bit-and (int (first xs)) 0xff))
+                     (+ bits 8)
+                     out)]
+        (recur (next xs) buffer bits out))
+      (apply str
+             (persistent!
+              (if (pos? bits)
+                ;; RFC 4648 pads the final partial group with zero bits.
+                (conj! out (alphabet-char
+                            (bit-and (bit-shift-left buffer (- 5 bits)) 31)))
+                out))))))
+
+(defn decode
+  "Lowercase RFC 4648 base32 without padding to bytes; reject bad input."
+  [text]
+  (let [n (count text)
+        out (loop [i 0 buffer 0 bits 0 acc (transient [])]
+              (if (= i n)
+                (persistent! acc)
+                (let [ch (char-at text i)
+                      idx (or (alphabet-index ch)
+                              (throw (ex-info "multiformats: invalid base32 character"
+                                              {:char ch})))
+                      buffer (bit-or (bit-shift-left buffer 5) idx)
+                      bits (+ bits 5)]
+                  (if (>= bits 8)
+                    (let [remaining (- bits 8)]
+                      (recur (inc i)
+                             (bit-and buffer (dec (bit-shift-left 1 remaining)))
+                             remaining
+                             (conj! acc (bit-and (bit-shift-right buffer remaining)
+                                                 0xff))))
+                    (recur (inc i) buffer bits acc)))))]
+    #?(:clj (byte-array out) :cljs (vec out))))
