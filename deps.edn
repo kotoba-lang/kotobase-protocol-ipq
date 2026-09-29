@@ -3,7 +3,7 @@
  ;; from protocol-core, the selector and Data Model from io-ipld, and the CAR
  ;; framing from io-ipld-car. Every pin below is a commit on that repo's
  ;; default branch — an unmerged SHA is a dependency that disappears when its
- ;; branch does (root CLAUDE.md, `deps.edn` pins have no `verify-west-pins`).
+ ;; branch does (root AGENTS.md, `deps.edn` pins have no `verify-west-pins`).
  :deps {
         ;; kotoba.bytes replaced UTF-8 .getBytes / String. here (2026-09-24). An explicit
         ;; floor: tools.deps takes the NEWEST sha it is shown.
@@ -28,7 +28,7 @@
        ;; Tracks protocol-core's `main` tip; it is not held back for a reason.
         ;; A reader who finds this behind the default branch should advance it
         ;; rather than look for the justification that would have to be written
-        ;; here if it were deliberately frozen (root CLAUDE.md: a pin's default
+        ;; here if it were deliberately frozen (root AGENTS.md: a pin's default
         ;; state is the upstream default-branch tip).
         io.github.kotoba-lang/kotobase-protocol-core
         {:git/sha "ca3874d2dababed63bb1c357722c8a38e4a3a812"}

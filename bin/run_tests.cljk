@@ -1,4 +1,4 @@
-;; nbb test runner — the first-class runtime for this repo (root CLAUDE.md
+;; nbb test runner — the first-class runtime for this repo (root AGENTS.md
 ;; runtime priority). Run from the repo root:
 ;;
 ;;   kbb --backend sci bin/run_tests.cljk
